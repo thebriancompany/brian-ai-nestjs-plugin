@@ -132,8 +132,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
     // 비밀번호 변경 전에 발급된 토큰인지 확인
     if (user.passwordChangedAt) {
-      const tokenIssuedAt = new Date(payload.iat * 1000);
-      if (tokenIssuedAt < user.passwordChangedAt) {
+      // JWT의 iat과 동일하게 초 단위로 내림하여 비교
+      const passwordChangedAtSeconds = Math.floor(
+        user.passwordChangedAt.getTime() / 1000,
+      );
+      if (payload.iat < passwordChangedAtSeconds) {
         throw new UnauthorizedException('Token invalidated by password change');
       }
     }
@@ -142,5 +145,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 }
 ```
+
+초 단위 비교에서는 비밀번호 변경과 같은 초에 발급된 토큰을 허용한다. 같은 초 안에 변경 전에 발급된 토큰까지 즉시 무효화해야 한다면, 비밀번호 변경 시 사용자 레코드의 비밀번호 버전을 증가시키고 토큰에 담긴 버전과 비교한다.
 
 참고: [NestJS Authentication](https://docs.nestjs.com/security/authentication)

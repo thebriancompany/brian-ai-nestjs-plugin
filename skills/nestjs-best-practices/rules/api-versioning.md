@@ -114,12 +114,13 @@ export class UsersController {
 // 버전별 로직을 담은 공유 서비스
 @Injectable()
 export class UsersService {
-  async findOne(id: string, version: string): Promise<any> {
+  async findOneV1(id: string): Promise<UserV1Response> {
     const user = await this.repo.findOne({ where: { id } });
+    return this.toV1Response(user);
+  }
 
-    if (version === '1') {
-      return this.toV1Response(user);
-    }
+  async findOneV2(id: string): Promise<UserV2Response> {
+    const user = await this.repo.findOne({ where: { id } });
     return this.toV2Response(user);
   }
 
@@ -142,15 +143,21 @@ export class UsersService {
   }
 }
 
-// 컨트롤러에서 버전 추출
+// 위 컨트롤러 예제의 대안: Nest가 선택한 버전별 핸들러에서 서비스 호출
+// URI 전략에서는 /v1/users/:id, /v2/users/:id로 선택하며 헤더는 사용하지 않는다.
+// HEADER 전략에서는 X-API-Version으로 선택하며 미지원 버전은 404로 거부한다.
 @Controller('users')
 export class UsersController {
   @Get(':id')
-  async findOne(
-    @Param('id') id: string,
-    @Headers('X-API-Version') version: string = '1',
-  ): Promise<any> {
-    return this.usersService.findOne(id, version);
+  @Version('1')
+  findOneV1(@Param('id') id: string): Promise<UserV1Response> {
+    return this.usersService.findOneV1(id);
+  }
+
+  @Get(':id')
+  @Version('2')
+  findOneV2(@Param('id') id: string): Promise<UserV2Response> {
+    return this.usersService.findOneV2(id);
   }
 }
 
