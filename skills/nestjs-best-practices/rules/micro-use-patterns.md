@@ -64,20 +64,14 @@ export class InventoryController {
 // 클라이언트가 응답을 기대함
 @Injectable()
 export class OrdersService {
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    // 재고 확인: 계속 진행하려면 이 응답이 필요함
-    const inventory = await firstValueFrom(
+  async checkAvailability(dto: CheckInventoryDto): Promise<InventoryResult> {
+    // 조회 시점의 가용 재고를 반환하며, 재고를 예약하지는 않음
+    return firstValueFrom(
       this.inventoryClient.send<InventoryResult>(
         { cmd: 'check_inventory' },
         { productId: dto.productId, quantity: dto.quantity },
       ),
     );
-
-    if (!inventory.available) {
-      throw new BadRequestException('Insufficient inventory');
-    }
-
-    return this.repo.save(dto);
   }
 }
 
@@ -110,36 +104,6 @@ export class UsersService {
   }
 }
 
-// 중요 이벤트를 위한 혼합 패턴
-@Injectable()
-export class OrdersService {
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    const order = await this.repo.save(dto);
-
-    // 중요 작업: 재고 예약 (MessagePattern 사용)
-    const reserved = await firstValueFrom(
-      this.inventoryClient.send({ cmd: 'reserve_inventory' }, {
-        orderId: order.id,
-        items: dto.items,
-      }),
-    );
-
-    if (!reserved.success) {
-      await this.repo.delete(order.id);
-      throw new BadRequestException('Could not reserve inventory');
-    }
-
-    // 비핵심 작업: 알림 (EventPattern 사용)
-    this.eventClient.emit('order.created', {
-      orderId: order.id,
-      userId: dto.userId,
-      total: dto.total,
-    });
-
-    return order;
-  }
-}
-
 // 오류 처리 패턴
 // MessagePattern 오류는 호출자에게 전파됨
 @MessagePattern({ cmd: 'get_user' })
@@ -164,4 +128,17 @@ async handleOrderCreated(data: OrderCreatedEvent): Promise<void> {
 }
 ```
 
-참고: [NestJS Microservices](https://docs.nestjs.com/microservices/basics)
+### 주문과 재고처럼 여러 서비스의 상태를 변경하는 경우
+
+MessagePattern은 요청과 응답을 연결하지만 주문 저장과 원격 재고 예약을 하나의 트랜잭션으로 만들지는 않는다. 예약이 커밋된 뒤 응답이 유실되거나 주문 서비스가 종료될 수 있다. 타임아웃이나 통신 오류만으로 예약 실패를 확정하거나 로컬 주문을 삭제하면 안 된다. 위의 재고 조회 결과도 이후 주문의 재고 확보를 보장하지 않는다.
+
+중요한 작업에는 saga나 영속적인 작업 상태를 사용하는 복구 흐름을 설계한다.
+
+- 주문을 `pending` 상태로 저장하고, 재시작 후에도 처리할 작업을 찾을 수 있게 한다. DB 저장과 메시지 발행을 함께 보장해야 한다면 주문과 outbox 레코드를 같은 로컬 트랜잭션으로 기록하고 별도 전달자가 재시도한다.
+- 재고 예약에는 재시도해도 바뀌지 않는 멱등 키를 사용한다. 재고 서비스는 예약 변경과 해당 키의 처리 결과를 원자적으로 저장하고, 동일 요청에는 기존 결과를 반환한다. 주문 생성 요청 자체의 재시도도 같은 주문으로 연결해야 한다.
+- 응답이 없으면 결과를 조회하거나 같은 키로 재시도한다. 확인된 결과에 따라 주문을 `confirmed` 또는 `cancelled`로 전이하며, 일시적인 통신 실패는 재처리할 상태로 남긴다.
+- 예약을 취소해야 한다면 예약 해제도 멱등하게 수행하고, 보상 진행 상태를 저장해 실패하거나 재시작해도 이어서 처리한다. 늦게 도착한 예약 요청·응답이 취소를 되돌리지 않도록 상태 전이를 제어한다.
+
+앞의 `emit()` 예제는 전달 누락을 허용하는 알림에 한정한다. 주문 확정 이벤트처럼 전달이 필수인 이벤트도 상태 변경과 outbox 기록을 같은 트랜잭션으로 저장하고 소비자를 멱등하게 만든다. Outbox만으로 원격 작업의 성공이나 보상 완료까지 보장되지는 않는다. 관련 내용은 [트랜잭션 관리](db-use-transactions.md)와 [이벤트 사용](arch-use-events.md)을 참고한다.
+
+참고: [NestJS Microservices](https://docs.nestjs.com/microservices/basics), [Transactional outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html), [Saga orchestration](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga-orchestration.html)
