@@ -75,13 +75,16 @@ export class RequestTracker implements NestMiddleware, NestInterceptor {
     const releaseBeforeHandler = () => {
       if (started) return;
       started = true;
+      res.off('finish', releaseBeforeHandler);
+      res.off('close', releaseBeforeHandler);
       this.beforeHandlers--;
       this.starts.delete(req);
       this.notifyDrained();
     };
     this.starts.set(req, releaseBeforeHandler);
-    // 가드에서 거부된 요청도 정상 응답 완료 시 추적에서 해제한다.
+    // 핸들러에 진입하지 않은 요청도 응답 완료 또는 연결 종료 시 추적에서 해제한다.
     res.once('finish', releaseBeforeHandler);
+    res.once('close', releaseBeforeHandler);
     let released = false;
     const release = () => {
       if (released) return;
@@ -183,7 +186,7 @@ async function bootstrap() {
 
 시작 중에는 기본 신호 종료 동작을 유지한다. 비동기 초기화가 끝나기 전에 `app.close()`를 실행하면 뒤늦은 `listen()`으로 서버가 다시 열릴 수 있으므로 종료 핸들러를 시작 완료 후 등록한다.
 
-프로브 경로는 실제 전역 접두사와 맞춘다. 준비 상태 엔드포인트는 `ShutdownService.isShutdown()`이면 503을 반환한다([상태 검사 규칙](micro-use-health-checks.md)). 추적기와 상태 객체는 앱 전체에서 같은 인스턴스를 사용한다. 요청이 시작한 필수 비동기 작업은 반드시 반환하거나 `await`해야 한다. 반환하지 않은 작업과 별도 스트림의 수명은 이 추적기가 알 수 없다. 시간 초과 인터셉터처럼 구독을 먼저 해제하는 코드가 있으면 `finalize` 이후에도 원래 Promise가 실행될 수 있다. 그런 작업은 서비스에서 별도로 등록·추적하고 종료 시 실제 완료 또는 취소 완료를 기다려야 한다. 이 추적기만으로 취소되지 않은 결제·DB 작업까지 안전하게 비웠다고 판단하지 않는다. 가드·미들웨어 실행 중 연결이 끊기고 핸들러에도 진입하지 않은 요청은 완료 여부를 알 수 없으므로 강제 종료 제한까지 보수적으로 기다린다.
+프로브 경로는 실제 전역 접두사와 맞춘다. 준비 상태 엔드포인트는 `ShutdownService.isShutdown()`이면 503을 반환한다([상태 검사 규칙](micro-use-health-checks.md)). 추적기와 상태 객체는 앱 전체에서 같은 인스턴스를 사용한다. 요청이 시작한 필수 비동기 작업은 반드시 반환하거나 `await`해야 한다. 반환하지 않은 작업과 별도 스트림의 수명은 이 추적기가 알 수 없다. 시간 초과 인터셉터처럼 구독을 먼저 해제하는 코드가 있으면 `finalize` 이후에도 원래 Promise가 실행될 수 있다. 그런 작업은 서비스에서 별도로 등록·추적하고 종료 시 실제 완료 또는 취소 완료를 기다려야 한다. 이 추적기만으로 취소되지 않은 결제·DB 작업까지 안전하게 비웠다고 판단하지 않는다. 핸들러 진입 전 추적은 응답 완료나 연결 종료 시 해제하므로, 연결 종료 이후에도 계속되는 가드·미들웨어의 필수 비동기 작업은 별도로 등록·추적해야 한다.
 
 이 예제의 범위는 HTTP다. 큐 워커와 WebSocket을 함께 운영한다면 신규 작업을 멈추고 워커의 진행 중인 작업도 비운 다음 `app.close()`를 호출하도록 조율한다. BullMQ의 생산자 `Queue.close()`만으로 워커 작업 완료를 기다릴 수는 없다. 무한 스트림과 장기 작업은 취소·재시도 정책이 필요하다. 강제 종료 제한은 전파 대기 시간과 작업 최대 시간을 포함하고, Kubernetes의 `terminationGracePeriodSeconds`는 이 제한보다 길게 설정한다.
 
