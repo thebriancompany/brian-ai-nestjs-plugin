@@ -40,11 +40,12 @@ export class WelcomeNotifier {
   async notify(email: string): Promise<void> {
     try {
       await this.emailService.sendWelcome(email);
-    } catch (error: unknown) {
-      this.logger.error(
-        'Failed to send welcome email',
-        error instanceof Error ? error.stack : 'Non-Error rejection',
-      );
+    } catch {
+      // SDK 오류의 메시지·스택·응답에는 수신자나 인증 정보가 포함될 수 있다.
+      this.logger.error({
+        event: 'welcome_email.failed',
+        errorCode: 'WELCOME_EMAIL_SEND_FAILED',
+      });
     }
   }
 }
@@ -88,9 +89,9 @@ export class CleanupJob {
 // main.ts: 애플리케이션 생성 전에 치명적 오류 관찰자를 등록한다.
 import { writeSync } from 'node:fs';
 
-process.on('uncaughtExceptionMonitor', (error, origin) => {
+process.on('uncaughtExceptionMonitor', () => {
   // 프로세스가 종료될 때 비동기 로그가 비워진다고 가정하지 않는다.
-  writeSync(process.stderr.fd, `${origin}: ${error.stack ?? error.message}\n`);
+  writeSync(process.stderr.fd, 'UNCAUGHT_EXCEPTION\n');
 });
 
 async function bootstrap() {
@@ -98,11 +99,13 @@ async function bootstrap() {
   await app.listen(3000);
 }
 
-void bootstrap().catch((error: unknown) => {
-  writeSync(process.stderr.fd, `${error instanceof Error ? error.stack : 'Bootstrap failed'}\n`);
+void bootstrap().catch(() => {
+  writeSync(process.stderr.fd, 'BOOTSTRAP_FAILED\n');
   process.exit(1); // 초기화 도중 남은 핸들이 있어도 실패한 프로세스를 유지하지 않는다.
 });
 ```
+
+외부 서비스 오류는 원본 객체·메시지·스택을 그대로 기록하지 않고 애플리케이션에서 정한 허용 목록의 오류 코드로 변환한다. 위 예제는 모든 메일 전송 실패를 `WELCOME_EMAIL_SEND_FAILED`로 기록하므로 Error가 아닌 거부 값도 로그에 노출하지 않는다. 치명적 오류와 초기화 실패에도 같은 원칙을 적용한다. 상세 진단이 필요하면 [로깅 규칙](devops-use-logging.md)에 따라 마스킹을 검증한 로거와 접근이 제한된 로그 저장소를 사용한다.
 
 `EventEmitterModule.forRoot()`와 `ScheduleModule.forRoot()` 및 각 리스너·잡 프로바이더를 등록한다. `OrderNotifier.notify()`를 호출하는 쪽도 Promise를 반환하거나 await해야 한다. `emitAsync()`는 트랜잭션이나 영속 큐가 아니므로 한 리스너의 실패가 이미 완료된 다른 리스너의 변경을 되돌리지 않는다. 재고·결제 같은 작업은 [이벤트 규칙](arch-use-events.md)의 정합성·재시도 계약을 적용한다.
 
