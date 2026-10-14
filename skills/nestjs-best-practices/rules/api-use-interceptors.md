@@ -1,222 +1,96 @@
 ---
 title: 공통 관심사에 인터셉터를 사용한다
 impact: MEDIUM-HIGH
-impactDescription: "공통 로직을 명확하게 분리함"
-tags: api, interceptors, logging, caching
+impactDescription: "핸들러의 응답 스트림을 감싸 공통 동작을 적용함"
+tags: api, interceptors, logging, timeout
 ---
 
 ## 공통 관심사에 인터셉터를 사용한다
 
-인터셉터는 비즈니스 로직에 코드를 섞지 않고 응답 변환, 로깅, 캐싱, 성능 측정을 처리할 수 있다. 라우트 핸들러의 실행을 감싸므로 요청과 응답 스트림 모두에 접근할 수 있다.
+인터셉터는 가드 이후 핸들러 실행 전후의 공통 동작에 적합하다. 응답 변환·측정·시간 제한을 일관되게 적용하되 비즈니스 처리는 서비스에 둔다. 가드나 미들웨어에서 끝난 요청은 인터셉터가 관찰하지 못하므로 전체 HTTP 접근 로그는 미들웨어나 HTTP 로거에서 처리한다.
 
-**잘못된 예 (모든 메서드에서 로깅과 응답 변환을 수행함):**
+**잘못된 예 (모든 핸들러에 같은 측정 코드를 반복함):**
 
 ```typescript
-// 모든 컨트롤러 메서드에서 로깅함
-@Controller('users')
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    const start = Date.now();
-    this.logger.log('findAll called');
-
-    const users = await this.usersService.findAll();
-
-    this.logger.log(`findAll completed in ${Date.now() - start}ms`);
-    return users;
-  }
-
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    const start = Date.now();
-    this.logger.log(`findOne called with id: ${id}`);
-
-    const user = await this.usersService.findOne(id);
-
-    this.logger.log(`findOne completed in ${Date.now() - start}ms`);
-    return user;
-  }
-  // 모든 메서드에서 반복됨!
-}
-
-// 응답을 수동으로 감쌈
 @Get()
-async findAll(): Promise<{ data: User[]; meta: Meta }> {
+async findAll() {
+  const start = Date.now();
   const users = await this.usersService.findAll();
-  return {
-    data: users,
-    meta: { timestamp: new Date(), count: users.length },
-  };
+  this.logger.log(`Finished in ${Date.now() - start}ms`);
+  return users; // 실패 경로는 측정되지 않는다.
 }
 ```
 
-**올바른 예 (인터셉터로 공통 관심사를 처리함):**
+**올바른 예 (성공·실패·구독 해제를 관찰함):**
 
 ```typescript
-// 로깅 인터셉터
+import { finalize, tap, timeout, catchError } from 'rxjs/operators';
+import { TimeoutError, Observable } from 'rxjs';
+
 @Injectable()
-export class LoggingInterceptor implements NestInterceptor {
-  private readonly logger = new Logger('HTTP');
+export class TimingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(TimingInterceptor.name);
 
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const request = context.switchToHttp().getRequest();
-    const { method, url, body } = request;
-    const now = Date.now();
-
+    const started = performance.now();
+    let outcome = 'cancelled';
     return next.handle().pipe(
       tap({
-        next: (data) => {
-          const response = context.switchToHttp().getResponse();
-          this.logger.log(
-            `${method} ${url} ${response.statusCode} - ${Date.now() - now}ms`,
-          );
-        },
-        error: (error) => {
-          this.logger.error(
-            `${method} ${url} ${error.status || 500} - ${Date.now() - now}ms`,
-            error.stack,
-          );
-        },
+        complete: () => { outcome = 'completed'; },
+        error: () => { outcome = 'failed'; },
+      }),
+      finalize(() => {
+        this.logger.log({
+          event: 'handler.finished',
+          method: request.method,
+          route: request.route?.path, // 전체 URL·쿼리·body는 기록하지 않는다.
+          outcome,
+          durationMs: Math.round(performance.now() - started),
+        });
       }),
     );
   }
 }
 
-// 응답 변환 인터셉터
-@Injectable()
-export class TransformInterceptor<T> implements NestInterceptor<T, Response<T>> {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<Response<T>> {
-    return next.handle().pipe(
-      map((data) => ({
-        data,
-        meta: {
-          timestamp: new Date().toISOString(),
-          path: context.switchToHttp().getRequest().url,
-        },
-      })),
-    );
-  }
-}
-
-// 시간 초과 인터셉터
-@Injectable()
-export class TimeoutInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    return next.handle().pipe(
-      timeout(5000),
-      catchError((err) => {
-        if (err instanceof TimeoutError) {
-          throw new RequestTimeoutException('Request timed out');
-        }
-        throw err;
-      }),
-    );
-  }
-}
-
-// 전역 또는 컨트롤러별 적용
 @Module({
-  providers: [
-    { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
-    { provide: APP_INTERCEPTOR, useClass: TransformInterceptor },
-  ],
+  providers: [{ provide: APP_INTERCEPTOR, useClass: TimingInterceptor }],
 })
 export class AppModule {}
+```
 
-// 또는 컨트롤러별 적용
-@Controller('users')
-@UseInterceptors(LoggingInterceptor)
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    // 비즈니스 로직만 간결하게 유지
-    return this.usersService.findAll();
-  }
-}
+이 시간은 응답 스트림 처리 시간이며 실제 소켓 전송 완료까지의 시간이 아니다. 동일 인터셉터를 전역과 컨트롤러에 중복 등록하지 않는다. DI가 필요하면 `APP_INTERCEPTOR` 또는 클래스 기반 `@UseInterceptors`로 등록한다.
 
-// 사용자나 요청 문맥에 따라 내용이 달라지지 않는 공개 GET 응답에만 사용한다.
-// CacheModule을 이 프로바이더의 모듈에 import해야 한다.
-import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import type { Cache } from 'cache-manager';
+단일 응답 JSON API에는 다음처럼 응답 대기 시간을 제한할 수 있다.
 
+```typescript
 @Injectable()
-export class HttpCacheInterceptor implements NestInterceptor {
-  private readonly logger = new Logger(HttpCacheInterceptor.name);
-
-  constructor(
-    @Inject(CACHE_MANAGER) private cacheManager: Cache,
-    private reflector: Reflector,
-  ) {}
-
-  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
-    const request = context.switchToHttp().getRequest();
-    const enabled = this.reflector.getAllAndOverride<boolean>('publicCache', [
-      context.getHandler(), context.getClass(),
-    ]);
-    // 인증 사용자, 쿠키가 있는 요청, 비공개 경로는 캐시를 공유하지 않는다.
-    if (!enabled || request.method !== 'GET' || request.user ||
-        request.headers.authorization || request.headers.cookie) {
-      return next.handle();
-    }
-
-    const cacheKey = this.generateKey(request);
-    const ttl = this.reflector.get<number>('cacheTTL', context.getHandler()) ?? 60_000;
-    try {
-      const cached = await this.cacheManager.get(cacheKey);
-      if (cached !== undefined && cached !== null) return of(cached);
-    } catch {
-      this.logger.warn('Cache read failed');
-    }
-
+export class TimeoutInterceptor implements NestInterceptor {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
     return next.handle().pipe(
-      mergeMap(async response => {
-        try {
-          await this.cacheManager.set(cacheKey, response, ttl);
-        } catch {
-          this.logger.warn('Cache write failed');
-        }
-        return response;
-      }),
-    );
-  }
-
-  private generateKey(request: Request): string {
-    return JSON.stringify([
-      'public', request.headers.host, request.originalUrl ?? request.url,
-      request.headers.accept, request.headers['accept-language'],
-    ]);
-  }
-}
-
-// 개인화·테넌트별 응답에는 이 공개 캐시를 적용하지 않는다.
-// TTL 단위는 현재 cache-manager에서 밀리초다.
-@Get()
-@SetMetadata('publicCache', true)
-@SetMetadata('cacheTTL', 60_000)
-@UseInterceptors(HttpCacheInterceptor)
-async findAll(): Promise<PublicCategoryDto[]> {
-  return this.categoriesService.findPublicCategories();
-}
-
-// 오류 매핑 인터셉터
-@Injectable()
-export class ErrorMappingInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    return next.handle().pipe(
-      catchError((error) => {
-        if (error instanceof EntityNotFoundError) {
-          throw new NotFoundException(error.message);
-        }
-        if (error instanceof QueryFailedError) {
-          if (error.message.includes('duplicate')) {
-            throw new ConflictException('Resource already exists');
-          }
+      timeout({ first: 5000 }),
+      catchError((error: unknown) => {
+        if (error instanceof TimeoutError) {
+          throw new GatewayTimeoutException('Operation timed out');
         }
         throw error;
       }),
     );
   }
 }
+
+@Controller('reports')
+@UseInterceptors(TimeoutInterceptor)
+export class ReportsController {
+  @Get(':id')
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
+    return this.reportsService.findOne(id);
+  }
+}
 ```
 
-참고: [NestJS Interceptors](https://docs.nestjs.com/interceptors)
+RxJS 시간 초과는 구독을 해제하지만 이미 실행 중인 Promise·DB 쿼리·결제를 자동 취소하지 않는다. 드라이버의 시간 제한과 취소 신호를 함께 사용하고, 변경 요청의 재시도에는 멱등성을 적용한다. `first`는 첫 응답까지의 제한이므로 무한 스트림 전체 수명을 제한하는 설정으로 사용하지 않는다.
+
+응답을 `{ data, meta }`로 감쌀 때는 해당 계약을 가진 JSON 라우트에만 적용한다. 파일 다운로드, SSE, 204, 직접 `@Res()`를 사용하는 라우트에 전역 변환을 적용하면 응답이 깨질 수 있다. 인터셉터는 요청에서 등록 순서로, 응답에서 역순으로 실행된다. DTO를 먼저 직렬화하고 감싸려면 응답 포장 인터셉터를 직렬화 인터셉터보다 바깥에 둔다. [응답 DTO](api-use-dto-serialization.md), [캐싱](perf-use-caching.md), [예외 필터](error-use-exception-filters.md)의 구현을 재사용하고 유사한 처리를 여러 계층에 중복하지 않는다.
+
+참고: [NestJS 11 Interceptors](https://docs.nestjs.com/v11/interceptors), [RxJS timeout](https://rxjs.dev/api/operators/timeout)

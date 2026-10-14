@@ -1,121 +1,81 @@
 ---
-title: 큰 모듈에 지연 로딩을 사용한다
+title: 선택적 프로바이더에 지연 로딩을 사용한다
 impact: MEDIUM
-impactDescription: "대규모 애플리케이션의 시작 시간을 개선함"
+impactDescription: "측정된 초기화 비용을 첫 사용 시점으로 미룸"
 tags: performance, lazy-loading, modules, optimization
 ---
 
-## 큰 모듈에 지연 로딩을 사용한다
+## 선택적 프로바이더에 지연 로딩을 사용한다
 
-NestJS는 처음 사용할 때까지 초기화를 미루는 모듈 지연 로딩을 지원한다. 일부 기능을 드물게 사용하는 대규모 애플리케이션, 콜드 스타트 시간이 중요한 서버리스 배포, 특정 모듈의 초기화 비용이 큰 상황에 유용하다.
+시작 시간이 실제 병목이고 기능을 드물게 사용한다면 `LazyModuleLoader`로 해당 프로바이더의 생성을 미룰 수 있다. 첫 요청 지연이 늘어나는 비용도 측정한다. 일반적인 기능 모듈을 시작 시 가져오는 것은 정상적인 기본값이며, 크다는 이유만으로 모두 지연 로딩하지 않는다.
 
-**잘못된 예 (모든 모듈을 시작할 때 로딩함):**
+컨트롤러·리졸버·게이트웨이·미들웨어는 이 방식으로 나중에 등록할 수 없다. 경로와 가드는 시작 시 등록하고, 그 경로에서 호출하는 계산 서비스를 지연 로딩한다. 지연 모듈의 생명주기 훅도 호출되지 않으므로 DB 연결이나 종료 훅에 의존하는 모듈에 그대로 적용하지 않는다.
+
+**잘못된 예 (필수 경로 등록까지 지연하고 훅에 초기화를 맡김):**
 
 ```typescript
-// 대규모 앱에서 모든 모듈을 시작 시 로딩
 @Module({
-  imports: [
-    UsersModule,
-    OrdersModule,
-    PaymentsModule,
-    ReportsModule, // 무겁고 드물게 사용됨
-    AnalyticsModule, // 무겁고 드물게 사용됨
-    AdminModule, // 관리자만 사용함
-    LegacyModule, // 드물게 사용하는 마이그레이션 모듈
-    BulkImportModule, // 한 달에 한 번 사용
-  ],
+  controllers: [ReportsController], // 늦게 로딩해도 경로가 등록되지 않음
+  providers: [ReportsGeneratorService],
 })
-export class AppModule {}
+export class ReportsModule {}
 
-// 사용하지 않아도 시작 시 모든 모듈을 초기화함
-// 서버리스에서 콜드 스타트가 느림
-// 사용하지 않는 모듈로 메모리 낭비
+@Injectable()
+export class ReportsGeneratorService implements OnModuleInit {
+  async onModuleInit(): Promise<void> {
+    await this.loadTemplates(); // 지연 모듈에서는 호출되지 않음
+  }
+}
 ```
 
-**올바른 예 (드물게 사용하는 모듈을 지연 로딩함):**
+**올바른 예 (기존 경로에서 선택적 계산 서비스를 지연 로딩함):**
 
 ```typescript
-// 선택적 모듈에는 LazyModuleLoader 사용
+import { Injectable } from '@nestjs/common';
 import { LazyModuleLoader } from '@nestjs/core';
+import type { ReportsGeneratorService } from './reports/reports-generator.service';
 
+// ReportsFacade는 시작 시 등록된 모듈의 프로바이더다.
+// ReportsModule은 시작 모듈의 imports 목록에 넣지 않는다.
 @Injectable()
-export class ReportsService {
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
+export class ReportsFacade {
+  private loading?: Promise<ReportsGeneratorService>;
 
-  async generateReport(type: string): Promise<Report> {
-    // 필요할 때만 모듈 로딩
+  constructor(private readonly lazyModuleLoader: LazyModuleLoader) {}
+
+  async generateReport(type: ReportType): Promise<Report> {
+    const generator = await this.getGenerator();
+    return generator.generate(type);
+  }
+
+  private getGenerator(): Promise<ReportsGeneratorService> {
+    // 동시에 들어온 최초 요청도 하나의 로딩 Promise를 공유한다.
+    // 실패한 Promise도 유지한다. Nest 내부의 부분 초기화 상태를 재사용하지 않는다.
+    return this.loading ??= this.loadGenerator();
+  }
+
+  private async loadGenerator(): Promise<ReportsGeneratorService> {
     const { ReportsModule } = await import('./reports/reports.module');
+    const { ReportsGeneratorService } = await import('./reports/reports-generator.service');
     const moduleRef = await this.lazyModuleLoader.load(() => ReportsModule);
-
-    const reportsService = moduleRef.get(ReportsGeneratorService);
-    return reportsService.generate(type);
+    return moduleRef.get(ReportsGeneratorService, { strict: true });
   }
 }
 
-// 캐싱과 함께 관리 기능을 지연 로딩
-@Injectable()
-export class AdminService {
-  private adminModule: ModuleRef | null = null;
+// reports/reports.module.ts (별도 파일)
+import { Module } from '@nestjs/common';
+import { ReportsGeneratorService } from './reports-generator.service';
 
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  private async getAdminModule(): Promise<ModuleRef> {
-    if (!this.adminModule) {
-      const { AdminModule } = await import('./admin/admin.module');
-      this.adminModule = await this.lazyModuleLoader.load(() => AdminModule);
-    }
-    return this.adminModule;
-  }
-
-  async runAdminTask(task: string): Promise<void> {
-    const moduleRef = await this.getAdminModule();
-    const taskRunner = moduleRef.get(AdminTaskRunner);
-    await taskRunner.run(task);
-  }
-}
-
-// 재사용 가능한 지연 로딩 서비스
-@Injectable()
-export class ModuleLoaderService {
-  private loadedModules = new Map<string, ModuleRef>();
-
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  async load<T>(
-    key: string,
-    importFn: () => Promise<{ default: Type<T> } | Type<T>>,
-  ): Promise<ModuleRef> {
-    if (!this.loadedModules.has(key)) {
-      const module = await importFn();
-      const moduleType = 'default' in module ? module.default : module;
-      const moduleRef = await this.lazyModuleLoader.load(() => moduleType);
-      this.loadedModules.set(key, moduleRef);
-    }
-    return this.loadedModules.get(key)!;
-  }
-}
-
-// 시작 후 백그라운드에서 모듈 미리 로딩
-@Injectable()
-export class ModulePreloader implements OnApplicationBootstrap {
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  async onApplicationBootstrap(): Promise<void> {
-    setTimeout(async () => {
-      await this.preloadModule(() => import('./reports/reports.module'));
-    }, 5000); // 시작 후 5초
-  }
-
-  private async preloadModule(importFn: () => Promise<any>): Promise<void> {
-    try {
-      const module = await importFn();
-      const moduleType = module.default || Object.values(module)[0];
-      await this.lazyModuleLoader.load(() => moduleType);
-    } catch (error) {
-      console.warn('Failed to preload module', error);
-    }
-  }
-}
+@Module({
+  providers: [ReportsGeneratorService],
+  exports: [ReportsGeneratorService],
+})
+export class ReportsModule {}
+// ReportsGeneratorService는 훅 초기화나 장기 연결이 필요 없는 싱글턴 계산 서비스다.
 ```
+
+Nest는 로딩한 모듈을 캐싱한다. 프로바이더 초기화 실패 후에도 내부 모듈 상태가 남을 수 있어, 이 예제는 실패를 유지하고 해당 기능의 복구에 앱 재시작을 요구한다. 필드를 `undefined`로 되돌려도 Nest 내부 상태는 초기화되지 않으므로 단순 재시도를 안전한 복구로 간주하지 않는다. 실패를 관찰·알림하고 재시작 정책을 정한다. 별도의 범용 모듈 레지스트리나 타이머 기반 프리로더는 필요가 확인될 때만 추가한다. 서비스 클래스도 동적 import하고 타입은 `import type`으로 가져와, 정적 import가 무거운 의존성을 먼저 로딩하지 않게 한다. 번들러의 실제 청크 분할 여부는 빌드 결과로 확인한다. 요청/일시적 스코프가 필요하면 `ModuleRef.get()` 대신 해당 요청 컨텍스트를 전달한 `resolve()` 전략을 별도로 설계한다.
+
+검증: 최초 동시 요청의 모듈 초기화 횟수와 실제 라우트 등록, 첫 요청과 후속 요청 지연을 확인한다. 실제 Nest 프로바이더 생성 실패를 주입해 후속 요청도 같은 실패를 받고 부분 초기화 인스턴스를 사용하지 않는지, 원인을 제거하고 앱을 재시작한 뒤 복구되는지 확인한다.
 
 참고: [NestJS Lazy Loading Modules](https://docs.nestjs.com/fundamentals/lazy-loading-modules)

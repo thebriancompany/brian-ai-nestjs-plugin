@@ -7,159 +7,81 @@ tags: dependency-injection, interfaces, solid, isp
 
 ## 인터페이스 분리 원칙을 적용한다
 
-사용하는 쪽이 필요하지 않은 인터페이스에 의존하도록 강요해서는 안 된다. NestJS에서는 관련 없는 메서드를 묶은 거대한 인터페이스 대신 특정 기능에 집중하는 작은 인터페이스를 유지하라는 뜻이다. 이메일 전송만 필요한 서비스가 SMS, 푸시 알림, 로깅까지 포함한 인터페이스에 의존해서는 안 된다. 큰 인터페이스를 역할별로 분리한다.
+소비자가 필요하지 않은 계약에 의존하도록 강요하지 않는다. 서로 다른 사용처나 변경 이유가 있는 인터페이스를 역할별로 나누되, 메서드마다 별도의 인터페이스를 만들 필요는 없다. 타입을 좁히는 것과 런타임 인스턴스를 나누는 것은 별개의 선택이다.
 
-**잘못된 예 (거대한 인터페이스가 사용하지 않는 의존성까지 강제함):**
+**잘못된 예 (이메일 소비자가 모든 채널의 계약에 의존함):**
 
 ```typescript
-// 거대한 인터페이스가 모든 사용처에 모든 기능에 대한 의존을 강제함
-interface NotificationService {
+export const NOTIFICATIONS = Symbol('NOTIFICATIONS');
+interface Notifications {
   sendEmail(to: string, subject: string, body: string): Promise<void>;
   sendSms(phone: string, message: string): Promise<void>;
-  sendPush(userId: string, notification: PushPayload): Promise<void>;
-  sendSlack(channel: string, message: string): Promise<void>;
-  logNotification(type: string, payload: any): Promise<void>;
-  getDeliveryStatus(id: string): Promise<DeliveryStatus>;
-  retryFailed(id: string): Promise<void>;
-  scheduleNotification(dto: ScheduleDto): Promise<string>;
+  getDeliveryStatus(id: string): Promise<string>;
 }
 
-// 이메일만 필요하지만 테스트에서 모든 기능을 모의 구현해야 함
 @Injectable()
-export class OrdersService {
-  constructor(
-    private notifications: NotificationService, // 8개 메서드에 의존하지만 1개만 사용
-  ) {}
+export class ReceiptsService {
+  constructor(@Inject(NOTIFICATIONS) private readonly notifications: Notifications) {}
 
-  async confirmOrder(order: Order): Promise<void> {
-    await this.notifications.sendEmail(
-      order.customer.email,
-      'Order Confirmed',
-      `Your order ${order.id} has been confirmed.`,
-    );
+  send(to: string, receipt: string): Promise<void> {
+    return this.notifications.sendEmail(to, 'Receipt', receipt);
   }
 }
 
-// 사용하지 않는 메서드까지 모의 구현해야 하므로 테스트가 어려움
-const mockNotificationService = {
+// ReceiptsService는 이메일만 쓰지만 대역에도 나머지 계약이 필요하다.
+const fakeNotifications: Notifications = {
   sendEmail: jest.fn(),
-  sendSms: jest.fn(),           // 사용하지 않지만 필수
-  sendPush: jest.fn(),          // 사용하지 않지만 필수
-  sendSlack: jest.fn(),         // 사용하지 않지만 필수
-  logNotification: jest.fn(),   // 사용하지 않지만 필수
-  getDeliveryStatus: jest.fn(), // 사용하지 않지만 필수
-  retryFailed: jest.fn(),       // 사용하지 않지만 필수
-  scheduleNotification: jest.fn(), // 사용하지 않지만 필수
+  sendSms: jest.fn(),
+  getDeliveryStatus: jest.fn(),
 };
 ```
 
-**올바른 예 (기능별로 인터페이스를 분리함):**
+**올바른 예 (소비자가 필요한 계약만 주입받음):**
 
 ```typescript
-// 분리한 인터페이스: 각각 하나의 기능에 집중
-interface EmailSender {
-  sendEmail(to: string, subject: string, body: string): Promise<void>;
-}
-
-interface SmsSender {
-  sendSms(phone: string, message: string): Promise<void>;
-}
-
-interface PushSender {
-  sendPush(userId: string, notification: PushPayload): Promise<void>;
-}
-
-interface NotificationLogger {
-  logNotification(type: string, payload: any): Promise<void>;
-}
-
-interface NotificationScheduler {
-  scheduleNotification(dto: ScheduleDto): Promise<string>;
-}
-
-// 하나의 구현체가 여러 인터페이스를 구현할 수 있음
-@Injectable()
-export class NotificationService implements EmailSender, SmsSender, PushSender {
-  async sendEmail(to: string, subject: string, body: string): Promise<void> {
-    // 이메일 구현
-  }
-
-  async sendSms(phone: string, message: string): Promise<void> {
-    // SMS 구현
-  }
-
-  async sendPush(userId: string, notification: PushPayload): Promise<void> {
-    // 푸시 구현
-  }
-}
-
-// 또는 구현체를 분리
-@Injectable()
-export class SendGridEmailService implements EmailSender {
-  async sendEmail(to: string, subject: string, body: string): Promise<void> {
-    // SendGrid 전용 구현
-  }
-}
-
-// 사용하는 쪽은 필요한 기능에만 의존
-@Injectable()
-export class OrdersService {
-  constructor(
-    @Inject(EMAIL_SENDER) private emailSender: EmailSender, // 최소 의존성
-  ) {}
-
-  async confirmOrder(order: Order): Promise<void> {
-    await this.emailSender.sendEmail(
-      order.customer.email,
-      'Order Confirmed',
-      `Your order ${order.id} has been confirmed.`,
-    );
-  }
-}
-
-// 사용하는 기능만 모의 구현하면 되므로 테스트가 간단함
-const mockEmailSender: EmailSender = {
-  sendEmail: jest.fn(),
-};
-
-// 토큰을 사용한 모듈 등록
+// notification-ports.ts — 데코레이터 평가 전에 정의한 같은 토큰을 import한다.
 export const EMAIL_SENDER = Symbol('EMAIL_SENDER');
 export const SMS_SENDER = Symbol('SMS_SENDER');
 
+export interface EmailSender {
+  sendEmail(to: string, subject: string, body: string): Promise<void>;
+}
+export interface SmsSender {
+  sendSms(phone: string, message: string): Promise<void>;
+}
+
+@Injectable()
+export class ReceiptsService {
+  constructor(@Inject(EMAIL_SENDER) private readonly email: EmailSender) {}
+
+  send(to: string, receipt: string): Promise<void> {
+    return this.email.sendEmail(to, 'Receipt', receipt);
+  }
+}
+
+const fakeEmail: EmailSender = { sendEmail: jest.fn() };
+
+// 기존 NotificationService가 EmailSender와 SmsSender를 모두 구현한다고 가정한다.
+// 외부 전송의 구현·설정은 해당 서비스가 소유한다.
 @Module({
   providers: [
-    { provide: EMAIL_SENDER, useClass: SendGridEmailService },
-    { provide: SMS_SENDER, useClass: TwilioSmsService },
+    NotificationService,
+    { provide: EMAIL_SENDER, useExisting: NotificationService },
+    { provide: SMS_SENDER, useExisting: NotificationService },
   ],
   exports: [EMAIL_SENDER, SMS_SENDER],
 })
 export class NotificationModule {}
+
+@Module({
+  imports: [NotificationModule],
+  providers: [ReceiptsService],
+})
+export class ReceiptsModule {}
 ```
 
-**필요할 때 인터페이스를 조합하기:**
+`useExisting`은 등록된 기본 스코프 `NotificationService` 인스턴스를 두 계약으로 노출한다. 실제 전송 구현도 분리할 이유가 있다면 각 토큰에 별도의 `useClass`를 등록한다. 타입 선언만 좁힌다고 Nest가 인터페이스를 알아서 주입하지는 않으므로 토큰·프로바이더·모듈 경계를 함께 맞춘다.
 
-```typescript
-// 사용하는 쪽에 실제로 여러 기능이 필요한 경우도 있음
-interface EmailAndSmsSender extends EmailSender, SmsSender {}
+여러 채널을 쓰는 소비자는 `EMAIL_SENDER`와 `SMS_SENDER`를 각각 주입받을 수 있다. 별도 복합 계약이 실제로 필요한 경우에만 교차 타입과 그 타입을 만족하는 구현의 토큰을 등록한다. 교차 타입 자체가 런타임 토큰은 아니다.
 
-// 또는 교차 타입 사용
-type MultiChannelSender = EmailSender & SmsSender & PushSender;
-
-// 여러 채널이 필요한 서비스
-@Injectable()
-export class AlertService {
-  constructor(
-    @Inject(MULTI_CHANNEL_SENDER)
-    private sender: EmailSender & SmsSender,
-  ) {}
-
-  async sendCriticalAlert(user: User, message: string): Promise<void> {
-    await Promise.all([
-      this.sender.sendEmail(user.email, 'Critical Alert', message),
-      this.sender.sendSms(user.phone, message),
-    ]);
-  }
-}
-```
-
-참고: [Interface Segregation Principle](https://en.wikipedia.org/wiki/Interface_segregation_principle)
+참고: [NestJS Custom Providers](https://docs.nestjs.com/fundamentals/custom-providers)

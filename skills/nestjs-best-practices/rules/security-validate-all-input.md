@@ -7,7 +7,7 @@ tags: security, validation, dto, pipes
 
 ## DTO와 파이프로 모든 입력을 검증한다
 
-항상 DTO의 class-validator 데코레이터와 전역 ValidationPipe로 들어오는 데이터를 검증한다. 사용자 입력을 신뢰하지 않는다. 처리 전에 모든 요청 본문, 쿼리 매개변수, 경로 매개변수를 검증한다.
+프로젝트의 검증 도구로 외부 입력의 타입·범위·크기를 검증한다. class-validator를 쓰는 프로젝트에서는 클래스 DTO와 전역 ValidationPipe를 함께 사용한다. 사용자 입력을 신뢰하지 않는다. 처리 전에 모든 요청 본문, 쿼리 매개변수, 경로 매개변수를 검증한다.
 
 **잘못된 예 (검증 없이 원시 입력을 신뢰함):**
 
@@ -17,13 +17,13 @@ tags: security, validation, dto, pipes
 export class UsersController {
   @Post()
   create(@Body() body: any) {
-    // body에는 SQL 인젝션, XSS 등 무엇이든 들어올 수 있음
+    // 예상하지 않은 필드(예: isAdmin)까지 서비스로 전달될 수 있음
     return this.usersService.create(body);
   }
 
   @Get()
   findAll(@Query() query: any) {
-    // query.limit은 "'; DROP TABLE users; --"일 수도 있음
+    // query.limit은 배열, 빈 문자열, 음수 또는 과도하게 큰 값일 수 있음
     return this.usersService.findAll(query.limit);
   }
 }
@@ -46,7 +46,9 @@ async function bootstrap() {
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,              // 알 수 없는 프로퍼티 제거
-      forbidNonWhitelisted: true,   // 알 수 없는 프로퍼티에 예외 발생
+      forbidNonWhitelisted: true,   // 제거 대신 알 수 없는 프로퍼티를 거부
+      forbidUnknownValues: true,
+      validationError: { target: false, value: false },
       transform: true,              // DTO 타입으로 자동 변환
       transformOptions: {
         enableImplicitConversion: false,
@@ -64,14 +66,13 @@ import {
   IsInt,
   Min,
   Max,
-  IsOptional,
+  ValidateIf,
   MinLength,
   MaxLength,
-  Matches,
   IsNotEmpty,
   IsUUID,
 } from 'class-validator';
-import { Transform, Type } from 'class-transformer';
+import { Transform } from 'class-transformer';
 
 export class CreateUserDto {
   @IsString()
@@ -82,6 +83,7 @@ export class CreateUserDto {
   name: string;
 
   @IsEmail()
+  @MaxLength(254)
   @Transform(({ value }) => typeof value === 'string' ? value.toLowerCase().trim() : value)
   email: string;
 
@@ -91,32 +93,35 @@ export class CreateUserDto {
   age: number;
 
   @IsString()
-  @MinLength(8)
-  @MaxLength(100)
-  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/, {
-    message: 'Password must contain uppercase, lowercase, and number',
-  })
+  @MinLength(12)
+  @MaxLength(128)
   password: string;
 }
 
-// 기본값과 변환을 적용한 쿼리 DTO
+// 빈 문자열·배열·16진수 등을 숫자 0 등으로 조용히 변환하지 않는다.
+function toDecimalInteger(value: unknown): unknown {
+  return typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value)
+    ? Number(value)
+    : value;
+}
+
+// 기본값과 명시적인 변환을 적용한 쿼리 DTO
 export class FindUsersQueryDto {
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined) // null은 허용하지 않는다.
   @IsString()
   @MaxLength(100)
   search?: string;
 
-  @IsOptional()
-  @Type(() => Number)
+  @Transform(({ value }) => toDecimalInteger(value))
   @IsInt()
   @Min(1)
   @Max(100)
   limit: number = 20;
 
-  @IsOptional()
-  @Type(() => Number)
+  @Transform(({ value }) => toDecimalInteger(value))
   @IsInt()
   @Min(0)
+  @Max(10000) // 대량 탐색이 필요하면 커서 기반 페이지네이션 사용
   offset: number = 0;
 }
 
@@ -128,9 +133,12 @@ export class UserIdParamDto {
 
 @Controller('users')
 export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
   @Post()
   create(@Body() dto: CreateUserDto): Promise<User> {
-    // dto가 유효함을 보장함
+    // 형태 검증 이후에도 권한·유일성 등 도메인 규칙을 확인한다.
+    // 서비스는 password를 해시한 뒤 저장하고 응답 DTO에서 제외해야 한다.
     return this.usersService.create(dto);
   }
 
@@ -147,5 +155,9 @@ export class UsersController {
   }
 }
 ```
+
+DTO는 런타임 클래스여야 하므로 `interface`나 `import type`만으로 전달하지 않는다. 중첩 객체에는 `@ValidateNested()`와 `@Type(() => NestedDto)`, 배열에는 `@IsArray()`·크기 제한·각 원소 검증을 적용한다. `@IsOptional()`은 `undefined`뿐 아니라 `null`도 건너뛰므로 PATCH에서 필드 생략과 명시적인 null을 구분한다.
+
+길이와 비밀번호 정책은 제품 요구와 해시 알고리즘에 맞게 조정한다. 비밀번호를 trim하거나 조용히 잘라서는 안 된다. DTO 검증은 SQL 매개변수 바인딩, 출력 문맥에 맞는 XSS 방어, 객체별 접근 권한 검사를 대체하지 않는다. 요청 파싱 전에 적용되는 본문·파일 크기 제한도 별도로 설정한다.
 
 참고: [NestJS Validation](https://docs.nestjs.com/techniques/validation)

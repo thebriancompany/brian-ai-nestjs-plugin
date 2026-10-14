@@ -1,139 +1,90 @@
 ---
-title: 출력을 정제해 XSS를 방지한다
+title: 출력 문맥에 맞게 XSS를 방지한다
 impact: HIGH
-impactDescription: "XSS 취약점은 사용자 세션과 데이터를 침해할 수 있음"
+impactDescription: "HTML 실행 지점에서 사용자 콘텐츠를 안전하게 처리함"
 tags: security, xss, sanitization, html
 ---
 
-## 출력을 정제해 XSS를 방지한다
+## 출력 문맥에 맞게 XSS를 방지한다
 
-NestJS API는 대체로 브라우저가 실행하지 않는 JSON을 반환하지만, HTML을 렌더링하거나 사용자 콘텐츠를 저장하거나 프런트엔드 프레임워크가 API 응답을 잘못 처리하면 XSS 위험이 발생한다. 사용자가 만든 콘텐츠는 저장 전에 정제하고 적절한 Content-Type 헤더를 사용한다.
+일반 텍스트는 그대로 저장하고 HTML에 표시할 때 템플릿의 자동 이스케이프나 DOM의 `textContent`를 사용한다. 사용자에게 HTML 작성을 허용하는 필드만 허용 목록 기반 정제기를 적용한다. JSON 응답에 문자열이 들어 있다는 사실 자체가 XSS는 아니지만, 브라우저에서 그 값을 `innerHTML` 등으로 실행하면 문제가 된다. HTML 본문용 정제 결과도 JavaScript·CSS·URL·HTML 속성 문맥에 그대로 넣어서는 안 된다.
 
-**잘못된 예 (정제하지 않은 HTML을 그대로 저장함):**
+**잘못된 예 (사용자 HTML을 실행 가능한 문맥에 그대로 삽입함):**
 
 ```typescript
-// 사용자가 보낸 HTML을 그대로 저장
-@Injectable()
-export class CommentsService {
-  async create(dto: CreateCommentDto): Promise<Comment> {
-    // 사용자가 다음 코드를 주입할 수 있음: <script>steal(document.cookie)</script>
-    return this.repo.save({
-      content: dto.content, // 정제하지 않은 원본
-      authorId: dto.authorId,
-    });
-  }
-}
-
-// 정제하지 않고 HTML 반환
 @Controller('pages')
 export class PagesController {
   @Get(':slug')
-  @Header('Content-Type', 'text/html')
+  @Header('Content-Type', 'text/html; charset=utf-8')
   async getPage(@Param('slug') slug: string): Promise<string> {
     const page = await this.pagesService.findBySlug(slug);
-    // page.content에 사용자 입력이 있으면 XSS 가능
+    // <script>, 이벤트 속성, javascript: 링크 등이 브라우저에서 실행될 수 있다.
     return `<html><body>${page.content}</body></html>`;
   }
 }
-
-// 오류에 사용자 입력 반영
-@Get(':id')
-async findOne(@Param('id') id: string): Promise<User> {
-  const user = await this.repo.findOne({ where: { id } });
-  if (!user) {
-    // id에 악성 콘텐츠가 있고 오류를 렌더링하면 XSS 발생
-    throw new NotFoundException(`User ${id} not found`);
-  }
-  return user;
-}
 ```
 
-**올바른 예 (콘텐츠를 정제하고 적절한 헤더를 사용함):**
+**올바른 예 (허용된 HTML만 본문에 렌더링함):**
 
 ```typescript
-// 저장 전에 HTML 콘텐츠 정제
-import * as sanitizeHtml from 'sanitize-html';
+// esModuleInterop을 사용하는 TypeScript 설정 기준
+import sanitizeHtml from 'sanitize-html';
+import { IsString, MaxLength } from 'class-validator';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+
+const richTextPolicy: sanitizeHtml.IOptions = {
+  allowedTags: ['b', 'i', 'em', 'strong', 'a', 'p', 'br'],
+  allowedAttributes: { a: ['href', 'title'] },
+  allowedSchemes: ['http', 'https', 'mailto'],
+  allowProtocolRelative: false,
+};
+
+export class CreateCommentDto {
+  @IsString()
+  @MaxLength(10000)
+  content: string;
+}
 
 @Injectable()
 export class CommentsService {
-  private readonly sanitizeOptions: sanitizeHtml.IOptions = {
-    allowedTags: ['b', 'i', 'em', 'strong', 'a', 'p', 'br'],
-    allowedAttributes: {
-      a: ['href', 'title'],
-    },
-    allowedSchemes: ['http', 'https', 'mailto'],
-  };
+  constructor(@InjectRepository(Comment) private readonly repo: Repository<Comment>) {}
 
-  async create(dto: CreateCommentDto): Promise<Comment> {
+  // authorId는 인증 가드의 현재 사용자에서 전달한다. 요청 본문에서 받지 않는다.
+  async create(dto: CreateCommentDto, authorId: string): Promise<Comment> {
     return this.repo.save({
-      content: sanitizeHtml(dto.content, this.sanitizeOptions),
-      authorId: dto.authorId,
+      content: sanitizeHtml(dto.content, richTextPolicy),
+      authorId,
     });
   }
 }
 
-// 검증 파이프로 HTML 제거
-import { Transform } from 'class-transformer';
+@Controller('pages')
+export class PagesController {
+  constructor(private readonly pagesService: PagesService) {}
 
-export class CreatePostDto {
-  @IsString()
-  @MaxLength(1000)
-  @Transform(({ value }) => typeof value === 'string' ? sanitizeHtml(value, { allowedTags: [] }) : value)
-  title: string;
-
-  @IsString()
-  @Transform(({ value }) =>
-    typeof value === 'string' ? sanitizeHtml(value, {
-      allowedTags: ['p', 'br', 'b', 'i', 'a'],
-      allowedAttributes: { a: ['href'] },
-    }) : value,
-  )
-  content: string;
-}
-
-// 적절한 Content-Type 헤더 설정
-@Controller('api')
-export class ApiController {
-  @Get('data')
-  @Header('Content-Type', 'application/json')
-  async getData(): Promise<DataResponse> {
-    // JSON 응답이므로 브라우저가 스크립트를 실행하지 않음
-    return this.service.getData();
+  @Get(':slug')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  async getPage(@Param('slug') slug: string): Promise<string> {
+    const page = await this.pagesService.findBySlug(slug);
+    // 기존 데이터나 다른 저장 경로도 현재 정책을 거치도록 출력 시 적용한다.
+    const content = sanitizeHtml(page.content, richTextPolicy);
+    return `<!doctype html><html><body>${content}</body></html>`;
   }
 }
 
-// 오류 메시지 정제
-@Get(':id')
-async findOne(@Param('id', ParseUUIDPipe) id: string): Promise<User> {
-  const user = await this.repo.findOne({ where: { id } });
-  if (!user) {
-    // UUID 검증으로 안전한 형식 보장
-    throw new NotFoundException('User not found');
-  }
-  return user;
-}
-
-// Helmet으로 CSP 헤더 설정
+// Express 어댑터: 보안 헤더는 HTML 정제와 함께 사용하는 방어 수단이다.
 import helmet from 'helmet';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-
-  app.use(
-    helmet({
-      contentSecurityPolicy: {
-        directives: {
-          defaultSrc: ["'self'"],
-          scriptSrc: ["'self'"],
-          styleSrc: ["'self'", "'unsafe-inline'"],
-          imgSrc: ["'self'", 'data:', 'https:'],
-        },
-      },
-    }),
-  );
-
+  app.use(helmet()); // 기본 CSP를 시작점으로 실제 렌더링 정책에 맞게 조정한다.
   await app.listen(3000);
 }
 ```
 
-참고: [OWASP XSS Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
+정제 후 문자열에 검증되지 않은 HTML을 덧붙이면 보호가 깨진다. 클라이언트도 일반 텍스트에는 자동 이스케이프를 유지하고, HTML 렌더링을 허용하는 위치를 한정한다. API의 CSP 헤더는 별도 프런트엔드 문서에 적용되지 않는다. Fastify에서는 Express용 `helmet()` 미들웨어 대신 호환되는 `@fastify/helmet` 플러그인을 등록한다.
+
+DTO의 길이 제한과 별도로 HTTP 파서의 본문 크기 제한도 설정한다. HTML을 제거하는 것으로 SQL 인젝션이나 소유자 위조를 방지할 수는 없으며, DB 매개변수 바인딩과 인증·인가를 별도로 적용한다. JSON 응답은 Nest의 기본 직렬화를 사용하고 비밀번호 해시 등 민감한 필드는 [응답 DTO 규칙](api-use-dto-serialization.md)에 따라 제외한다.
+
+참고: [OWASP XSS Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html), [sanitize-html](https://github.com/apostrophecms/sanitize-html), [NestJS 보안 헤더](https://docs.nestjs.com/security/helmet)

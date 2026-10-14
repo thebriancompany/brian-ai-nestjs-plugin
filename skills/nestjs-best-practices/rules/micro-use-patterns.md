@@ -70,7 +70,7 @@ export class OrdersService {
       this.inventoryClient.send<InventoryResult>(
         { cmd: 'check_inventory' },
         { productId: dto.productId, quantity: dto.quantity },
-      ),
+      ).pipe(timeout({ first: 3000 })),
     );
   }
 }
@@ -83,21 +83,25 @@ export class NotificationsController {
     // 반환값 없이 이벤트만 처리
     await this.emailService.sendWelcome(data.email);
     await this.analyticsService.track('user_signup', data);
-    // 실패해도 발신자에게 영향을 주지 않음
+    // 처리 실패는 발신자의 응답으로 전달되지 않는다. 소비 측 재시도 정책이 필요하다.
   }
 }
 
 // 클라이언트가 기다리지 않고 이벤트 발행
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   async createUser(dto: CreateUserDto): Promise<User> {
     const user = await this.repo.save(dto);
 
-    // 실행 후 기다리지 않으며 진행을 막지 않음
+    // emit()은 hot Observable이다. 전송 오류를 관찰하되 소비자 완료 응답으로 간주하지 않는다.
     this.eventClient.emit('user.created', {
       userId: user.id,
       email: user.email,
-      timestamp: new Date(),
+      timestamp: new Date().toISOString(),
+    }).subscribe({
+      error: () => this.logger.error('user.created publish failed'),
     });
 
     return user; // 이벤트 처리와 관계없이 사용자 생성 성공
@@ -107,26 +111,23 @@ export class UsersService {
 // 오류 처리 패턴
 // MessagePattern 오류는 호출자에게 전파됨
 @MessagePattern({ cmd: 'get_user' })
-async getUser(userId: string): Promise<User> {
+async getUser(userId: string): Promise<UserResponseDto> {
   const user = await this.repo.findOne({ where: { id: userId } });
   if (!user) {
     throw new RpcException('User not found'); // 호출자가 수신함
   }
-  return user;
+  return { id: user.id, name: user.name };
 }
 
-// EventPattern 오류는 처리하는 쪽에서 다뤄야 함
+// EventPattern의 재시도·ack는 전송 계층 설정과 함께 결정한다.
 @EventPattern('order.created')
 async handleOrderCreated(data: OrderCreatedEvent): Promise<void> {
-  try {
-    await this.processOrder(data);
-  } catch (error) {
-    // 로그를 기록하고 필요하면 재시도하며 예외는 던지지 않음
-    this.logger.error('Failed to process order event', error);
-    await this.deadLetterQueue.add(data);
-  }
+  await this.processOrder(data); // eventId를 기준으로 멱등 처리하고 실패를 전파한다.
+  // 오류를 삼켜 성공으로 ack하지 않는다. RPC 예외 자체가 재배달을 보장하지는 않는다.
 }
 ```
+
+클라이언트와 서버의 패턴 이름·payload DTO를 일치시키고 메시지 입력도 검증한다. `timeout`과 `firstValueFrom`은 RxJS에서 가져온다. 앱 종료 시 `ClientProxy.close()`로 연결을 정리한다. RabbitMQ 수동 ack, Kafka offset 등 전달 확인 방식은 다르므로 실패 재시도·최대 횟수·dead letter 처리를 사용하는 전송 계층에 맞게 구성한다. 이메일과 분석 이벤트가 함께 처리되면 후속 실패로 이메일이 중복 전송될 수 있으므로 각각 멱등 처리하거나 작업을 분리한다.
 
 ### 주문과 재고처럼 여러 서비스의 상태를 변경하는 경우
 

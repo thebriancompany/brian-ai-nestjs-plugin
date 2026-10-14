@@ -53,11 +53,11 @@ import { Job, Queue } from 'bullmq';
 export class ReportsService {
   constructor(@InjectQueue('reports') private reportsQueue: Queue) {}
 
-  async requestReport(dto: GenerateReportDto, ownerId: string): Promise<{ jobId: string }> {
+  async requestReport(dto: GenerateReportDto, ownerId: string, requestId: string): Promise<{ jobId: string }> {
     const scheduledAt = dto.scheduledFor ? Date.parse(dto.scheduledFor) : Date.now();
     if (!Number.isFinite(scheduledAt)) throw new BadRequestException('Invalid schedule');
-    const job = await this.reportsQueue.add('generate', { ...dto, ownerId }, {
-      priority: dto.urgent ? 1 : 10,
+    const job = await this.reportsQueue.add('generate', { parameters: dto, ownerId, requestId }, {
+      priority: 10,
       delay: Math.max(0, scheduledAt - Date.now()),
     });
     if (!job.id) throw new Error('Missing job ID');
@@ -72,14 +72,22 @@ export class ReportsService {
   }
 }
 
+// requestId는 재시도에도 동일한 검증된 업무 요청 ID다. ownerId는 인증 정보에서 온다.
+interface ReportJobData {
+  parameters: GenerateReportDto;
+  ownerId: string;
+  requestId: string;
+}
+
 @Processor('reports')
 export class ReportsProcessor extends WorkerHost {
   constructor(private readonly generator: ReportGenerator) { super(); }
 
-  async process(job: Job<GenerateReportDto>): Promise<Report> {
+  async process(job: Job<ReportJobData>): Promise<Report> {
     switch (job.name) {
       case 'generate':
-        // generator는 업무 키로 저장을 멱등 처리한다. 재시도 시 같은 결과를 반환한다.
+        // generator는 (ownerId, requestId)를 고유 키로 사용하며 재시도 시 기존 결과를 반환한다.
+        // 같은 키에 다른 parameters가 오면 충돌로 거부한다.
         await job.updateProgress(10);
         const report = await this.generator.generateAndSave(job.data);
         await job.updateProgress(100);
@@ -149,7 +157,9 @@ export class MaintenanceProcessor extends WorkerHost {
 export class QueueModule {}
 ```
 
-워커는 최소 한 번 실행될 수 있다. `attempts` 설정만으로 멱등성이 보장되지는 않는다. 예제의 `generateAndSave`와 `sendOnce`는 앱에서 구현할 업무 계약이며, DB의 고유 키나 발송 제공자의 멱등 키를 이용해야 한다. `jobId` 중복 방지도 완료 작업이 제거된 뒤에는 영구적인 중복 방지를 보장하지 않는다. DB 저장과 큐 발행을 함께 보장해야 한다면 트랜잭셔널 아웃박스를 사용한다.
+지연 시간은 실행 가능한 가장 이른 시각이며 정확한 실행 시각을 보장하지 않는다. 우선순위·예약 가능 기간·요청 빈도는 API에서 검증하며 클라이언트가 무제한 높은 우선순위를 지정하게 하지 않는다.
+
+워커 작업은 중복 실행될 수 있다. `attempts` 설정만으로 멱등성이 보장되지는 않는다. 예제의 `generateAndSave`와 `sendOnce`는 앱에서 구현할 업무 계약이며, DB의 고유 키나 발송 제공자의 멱등 키를 이용해야 한다. `jobId` 중복 방지도 완료 작업이 제거된 뒤에는 영구적인 중복 방지를 보장하지 않는다. DB 저장과 큐 발행을 함께 보장해야 한다면 트랜잭셔널 아웃박스를 사용한다.
 
 상태 조회는 작업 ID만으로 허용하지 말고 저장한 소유자와 현재 사용자를 대조한다. 여러 인스턴스의 예약 등록은 안정적인 scheduler ID를 공유한다. 큐 관리 화면을 추가한다면 라우트를 공개하기 전에 관리자 인증·인가를 적용한다. 큐 지연, 실패, 재시도 횟수와 워커 상태를 모니터링한다.
 

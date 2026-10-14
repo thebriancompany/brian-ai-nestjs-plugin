@@ -71,9 +71,8 @@ export class RedisHealthIndicator {
   }
 }
 
-@Controller('health')
+@Controller({ path: 'health', version: VERSION_NEUTRAL })
 @Public()
-@SkipThrottle({ short: true, medium: true, long: true })
 export class HealthController {
   constructor(
     private readonly health: HealthCheckService,
@@ -83,23 +82,30 @@ export class HealthController {
   ) {}
 
   @Get('live')
+  @SkipThrottle({ short: true, medium: true, long: true })
   liveness() { return { status: 'ok' }; }
 
   @Get('ready')
   @HealthCheck()
-  readiness() {
+  async readiness() {
     if (this.shutdown.isShutdown()) {
       throw new ServiceUnavailableException('Shutting down');
     }
-    return this.health.check([
-      () => this.db.pingCheck('database', { timeout: 1000 }),
-      () => this.redis.isHealthy('redis'), // Redis PING, HTTP가 아님
-    ]);
+    try {
+      await this.health.check([
+        () => this.db.pingCheck('database', { timeout: 1000 }),
+        () => this.redis.isHealthy('redis'), // Redis PING, HTTP가 아님
+      ]);
+      return { status: 'ok' };
+    } catch {
+      // 프로브 응답에 연결 정보나 드라이버의 상세 오류를 노출하지 않는다.
+      throw new ServiceUnavailableException('Not ready');
+    }
   }
 }
 ```
 
-모듈에는 `TerminusModule`, 앱에서 사용하는 `TypeOrmModule`과 Redis 클라이언트 제공 모듈을 가져오고, `RedisHealthIndicator`와 컨트롤러를 등록한다. `ShutdownService`는 [종료 규칙](devops-graceful-shutdown.md)과 같은 인스턴스를 주입한다. `Public`은 [가드 규칙](security-use-guards.md)의 데코레이터이며, `SkipThrottle`의 이름은 앱의 [요청 제한 설정](security-rate-limiting.md)에 맞춘다. 전역 접두사·버전 설정을 사용한다면 실제 프로브 URL도 맞춘다.
+모듈에는 `TerminusModule`, 앱에서 사용하는 `TypeOrmModule`과 Redis 클라이언트 제공 모듈을 가져오고, `RedisHealthIndicator`와 컨트롤러를 등록한다. [종료 규칙](devops-graceful-shutdown.md)의 `ShutdownModule`도 가져와 같은 `ShutdownService`를 주입한다. `Public`은 [가드 규칙](security-use-guards.md)의 데코레이터이며, `SkipThrottle`의 이름은 앱의 [요청 제한 설정](security-rate-limiting.md)에 맞춘다. 전역 접두사·버전 설정을 사용한다면 실제 프로브 URL도 맞춘다.
 
 `Promise.race`는 상태 검사 응답 시간만 제한하며 이미 전송한 Redis 명령을 취소하지 않는다. 클라이언트 자체의 명령 시간 제한도 필요하다. 외부 서비스 장애 때문에 모든 인스턴스가 재시작되지 않도록 liveness에 DB·Redis를 묶지 않는다. 선택적인 캐시를 사용한다면 Redis 장애를 readiness 실패 조건으로 삼을 필요는 없다. 상태 엔드포인트의 네트워크 접근을 제한하고 연결 정보나 오류 원문을 노출하지 않는다.
 

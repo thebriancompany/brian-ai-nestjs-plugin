@@ -1,13 +1,13 @@
 ---
 title: 올바른 모듈 공유 패턴을 사용한다
 impact: CRITICAL
-impactDescription: "중복 인스턴스, 메모리 누수, 상태 불일치를 방지함"
+impactDescription: "의도하지 않은 중복 인스턴스와 상태 불일치를 방지함"
 tags: architecture, modules, sharing, exports
 ---
 
 ## 올바른 모듈 공유 패턴을 사용한다
 
-NestJS 모듈은 기본적으로 싱글턴이다. 모듈에서 서비스를 올바르게 내보내고 다른 곳에서 해당 모듈을 가져오면 같은 인스턴스를 공유한다. 반면 여러 모듈에 같은 서비스를 프로바이더로 등록하면 각각 별도 인스턴스가 생성되어 메모리 낭비, 상태 불일치, 이해하기 어려운 동작이 발생한다. 항상 서비스를 전용 모듈에 캡슐화하고 명시적으로 내보낸 뒤, 필요한 곳에서 그 모듈을 가져온다.
+같은 애플리케이션 컨텍스트에서 같은 모듈이 내보내는 기본 스코프 프로바이더는 그 모듈을 가져오는 소비자들이 공유한다. 여러 모듈의 `providers`에 같은 클래스를 각각 등록하면 별도 인스턴스가 생긴다. 공유가 목적이라면 소유 모듈에서 내보내고 필요한 모듈에서 가져온다. 별도 프로세스, 별도 애플리케이션 컨텍스트, 요청/트랜지언트 스코프, 서로 다른 동적 모듈 등록까지 하나의 인스턴스를 보장하는 것은 아니다.
 
 **잘못된 예 (여러 모듈에서 같은 서비스를 프로바이더로 등록함):**
 
@@ -86,32 +86,34 @@ export class AppModule {}
 **@Global()을 사용할 때 (제한적으로 사용):**
 
 ```typescript
-// 애플리케이션 전반의 공통 관심사에만 사용
+// 애플리케이션 전반의 자체 로깅 프로바이더에만 사용
 @Global()
 @Module({
-  providers: [ConfigService, LoggerService],
-  exports: [ConfigService, LoggerService],
+  providers: [AppLogger],
+  exports: [AppLogger],
 })
 export class CoreModule {}
-
-// AppModule에서 한 번만 가져옴
-@Module({
-  imports: [CoreModule], // 전역으로 등록되어 어디서나 사용 가능
-})
-export class AppModule {}
 
 // 다른 모듈은 CoreModule을 가져올 필요가 없음
 @Module({
   controllers: [UsersController],
-  providers: [UsersService], // 모듈을 가져오지 않아도 ConfigService를 주입할 수 있음
+  providers: [UsersService], // CoreModule을 가져오지 않아도 AppLogger를 주입할 수 있음
 })
 export class UsersModule {}
+
+// AppModule에서 한 번만 가져옴
+@Module({
+  imports: [CoreModule, UsersModule], // 전역 등록 + 기능 모듈 등록
+})
+export class AppModule {}
 
 // 주의: 모든 것을 전역으로 만들지 말 것!
 // - 의존성이 숨겨짐 (imports만으로 모듈에 필요한 것을 알 수 없음)
 // - 테스트가 어려워짐
 // - 설정, 로깅, 데이터베이스 연결 등에 한정해서 사용
 ```
+
+`@nestjs/config`의 `ConfigService`를 직접 다시 등록하지 않는다. 공식 `ConfigModule.forRoot({ isGlobal: true, ... })` 또는 모듈 import/export를 사용해 설정 초기화와 검증을 유지한다. 같은 구현을 클래스 토큰과 사용자 정의 토큰으로 노출하려면 두 번 `useClass`로 등록하지 말고 `useExisting`으로 별칭을 만든다.
 
 **모듈 다시 내보내기 패턴:**
 

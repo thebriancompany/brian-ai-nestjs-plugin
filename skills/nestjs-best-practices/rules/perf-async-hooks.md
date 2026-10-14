@@ -1,109 +1,101 @@
 ---
 title: 비동기 생명주기 훅을 올바르게 사용한다
 impact: HIGH
-impactDescription: "잘못된 비동기 처리는 애플리케이션 시작을 막음"
+impactDescription: "초기화 경쟁 상태와 연결 누수, 시작 중 무한 대기를 방지함"
 tags: performance, lifecycle, async, hooks
 ---
 
 ## 비동기 생명주기 훅을 올바르게 사용한다
 
-NestJS의 생명주기 훅(`onModuleInit`, `onApplicationBootstrap` 등)은 비동기 작업을 지원한다. 하지만 잘못 사용하면 애플리케이션 시작을 막거나 경쟁 상태를 일으킬 수 있다. 생명주기의 순서를 이해하고 훅을 적절하게 사용한다.
+요청을 받기 전에 필요한 작업은 Nest가 기다릴 수 있도록 Promise를 반환한다. 연결과 쿼리에 제한 시간을 설정하고, 초기화 실패를 전파해 준비되지 않은 인스턴스가 트래픽을 받지 않게 한다. 같은 모듈의 다른 프로바이더 훅이 먼저 끝난다고 가정하지 않는다. 생성자나 초기화 과정에서 필요한 의존성은 비동기 팩토리 프로바이더로 준비한다.
 
-**잘못된 예 (await 없이 비동기 작업을 실행하고 기다리지 않음):**
+**잘못된 예 (초기화를 기다리지 않고 대여한 연결을 반납하지 않음):**
 
 ```typescript
-// await 없이 비동기 작업을 실행하고 기다리지 않음
 @Injectable()
 export class DatabaseService implements OnModuleInit {
-  onModuleInit() {
-    // 작업을 기다리지 않아 DB가 준비되기 전에 앱이 시작됨!
-    this.connect();
-  }
+  constructor(@Inject('PG_POOL') private readonly pool: Pool) {}
 
-  private async connect() {
-    await this.pool.connect();
-    console.log('Database connected');
-  }
-}
-
-// 생성자에서 오래 걸리는 블로킹 작업 수행
-@Injectable()
-export class ConfigService {
-  private config: Config;
-
-  constructor() {
-    // 전체 모듈 인스턴스 생성을 동기적으로 막음
-    this.config = fs.readFileSync('config.json');
+  onModuleInit(): void {
+    this.pool.connect();
+    // 연결 전에 서버가 시작되고 실패도 처리되지 않는다.
+    // connect()는 연결을 대여하므로 성공해도 release() 없이는 풀이 고갈된다.
   }
 }
 ```
 
-**올바른 예 (비동기 훅에서 Promise를 반환함):**
+**올바른 예 (준비를 기다리고 소유한 자원을 정리함):**
 
 ```typescript
-// 비동기 훅에서 Promise 반환
+import {
+  Injectable, Logger, OnApplicationShutdown, OnModuleInit,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Pool } from 'pg';
+
+// 이 프로바이더만 풀을 생성하고 종료한다. TypeORM 풀과 중복 생성하지 않는다.
 @Injectable()
-export class DatabaseService implements OnModuleInit {
-  private pool: Pool;
+export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
+  private readonly logger = new Logger(DatabaseService.name);
+  private readonly pool: Pool;
+  private closing?: Promise<void>;
 
-  async onModuleInit(): Promise<void> {
-    // NestJS는 완료될 때까지 기다린 후 계속 진행함
-    await this.pool.connect();
-    console.log('Database connected');
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    // 종료 시 자원 정리
-    await this.pool.end();
-    console.log('Database disconnected');
-  }
-}
-
-// 모듈 간 의존성이 있으면 onApplicationBootstrap 사용
-@Injectable()
-export class CacheWarmerService implements OnApplicationBootstrap {
-  constructor(
-    private cache: CacheService,
-    private products: ProductsService,
-  ) {}
-
-  async onApplicationBootstrap(): Promise<void> {
-    // 모든 모듈을 초기화했으므로 안전하게 캐시를 준비할 수 있음
-    const products = await this.products.findPopular();
-    await this.cache.warmup(products);
-  }
-}
-
-// 무거운 초기화는 생성자 대신 비동기 훅에서 수행
-@Injectable()
-export class ConfigService implements OnModuleInit {
-  private config: Config;
-
-  constructor() {
-    // 생성자는 동기적이고 빠르게 유지
+  constructor(config: ConfigService) {
+    this.pool = new Pool({
+      connectionString: config.getOrThrow<string>('DATABASE_URL'),
+      connectionTimeoutMillis: 5_000,
+      statement_timeout: 5_000,
+      query_timeout: 5_000, // 연결 후 응답 대기도 클라이언트에서 제한한다
+    });
+    this.pool.on('error', () => {
+      this.logger.error('Idle database connection failed');
+    });
   }
 
   async onModuleInit(): Promise<void> {
-    // 생명주기 훅에서 비동기 로딩
-    this.config = await this.loadConfig();
+    try {
+      // 단일 쿼리는 자동으로 연결을 대여하고 반납한다.
+      await this.pool.query('SELECT 1');
+    } catch (error) {
+      await this.closePool();
+      throw error;
+    }
   }
 
-  private async loadConfig(): Promise<Config> {
-    const file = await fs.promises.readFile('config.json');
-    return JSON.parse(file.toString());
+  async onApplicationShutdown(): Promise<void> {
+    // HTTP 연결 종료 후 풀을 닫는다. 진행 중인 작업의 종료 순서도 조정한다.
+    await this.closePool();
   }
 
-  get<T>(key: string): T {
-    return this.config[key];
+  private closePool(): Promise<void> {
+    return this.closing ??= this.pool.end();
   }
 }
 
-// main.ts에서 종료 훅 활성화
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  app.enableShutdownHooks(); // SIGTERM/SIGINT 처리 활성화
-  await app.listen(3000);
-}
+// 다른 프로바이더가 주입받는 시점부터 준비되어 있어야 하는 데이터의 예.
+import { readFile } from 'node:fs/promises';
+import { Module } from '@nestjs/common';
+
+export const EMAIL_TEMPLATE = Symbol('EMAIL_TEMPLATE');
+
+@Module({
+  providers: [{
+    provide: EMAIL_TEMPLATE,
+    useFactory: async (): Promise<string> => {
+      return readFile('templates/welcome.html', 'utf8');
+    },
+  }],
+  exports: [EMAIL_TEMPLATE],
+})
+export class TemplatesModule {}
+// 소비자는 @Inject(EMAIL_TEMPLATE)으로 주입한다.
+// Nest는 팩토리 Promise가 완료된 뒤 그 의존성을 사용하는 프로바이더를 생성한다.
 ```
 
-참고: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecycle-events)
+`onApplicationBootstrap()`은 모든 `onModuleInit()`이 끝난 뒤, 서버가 듣기 전에 실행된다. 필수 캐시 준비는 여기서 기다릴 수 있지만 선택적 워밍이 앱 가용성을 막지 않도록 실패 정책을 구분한다. 백그라운드 작업은 오류 처리와 종료 시 취소를 함께 구현한다. 요청 스코프와 지연 로딩 프로바이더에는 생명주기 훅이 호출되지 않는다.
+
+신호 기반 종료를 사용하면 부트스트랩에서 `app.enableShutdownHooks()`를 호출한다. 수동 신호 처리기를 사용하는 앱은 [종료 규칙](devops-graceful-shutdown.md)의 방식으로 소유권을 하나로 정한다. `pool.connect()`가 필요한 트랜잭션은 `finally`에서 `client.release()`해야 한다.
+
+검증: 초기화 거부 시 서버가 요청을 받지 않는지, 정상 시작 후 대여 연결이 남지 않는지, 종료 시 풀과 백그라운드 작업이 닫히는지 확인한다.
+
+참고: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecycle-events), [Async Providers](https://docs.nestjs.com/fundamentals/async-providers), [node-postgres Pool](https://node-postgres.com/apis/pool)

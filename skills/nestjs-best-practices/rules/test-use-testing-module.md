@@ -1,161 +1,87 @@
 ---
-title: 단위 테스트에 TestingModule을 사용한다
+title: DI 구성을 검증할 때 TestingModule을 사용한다
 impact: HIGH
-impactDescription: "모의 의존성으로 올바르게 격리된 테스트를 수행함"
+impactDescription: "실제 주입 토큰과 모의 의존성으로 동작을 검증함"
 tags: testing, unit-tests, mocking, jest
 ---
 
-## 단위 테스트에 TestingModule을 사용한다
+## DI 구성을 검증할 때 TestingModule을 사용한다
 
-`@nestjs/testing` 모듈로 모의 의존성을 사용하는 격리된 테스트 환경을 만든다. 이렇게 하면 테스트가 빠르게 실행되고 외부 서비스에 의존하지 않으며 비즈니스 로직을 독립적으로 검증할 수 있다.
+순수한 클래스는 `new Service(mock)`로 테스트해도 된다. `TestingModule`은 Nest의 주입 토큰·프로바이더 구성·override를 검증할 때 사용한다. 모든 테스트에 앱 전체를 import하지 말고 필요한 서비스와 모의 의존성만 등록한다.
 
-모의 의존성을 넣어 `new UsersService(mockRepo)`로 생성하는 단위 테스트도 유효하다. `TestingModule`은 Nest의 프로바이더 등록, 토큰, override 동작까지 검증할 때 사용한다.
-
-**잘못된 예 (단위 테스트에서 실제 외부 의존성을 사용함):**
+**잘못된 예 (결과나 실패 동작 없이 호출 여부만 확인함):**
 
 ```typescript
-// DI 없이 서비스 인스턴스를 직접 생성
-describe('UsersService', () => {
-  it('should create user', async () => {
-    // 문제는 new 자체가 아니라 실제 DB 의존성을 사용한다는 점
-    const repo = new UserRepository(); // 실제 리포지토리!
-    const service = new UsersService(repo);
-
-    const user = await service.create({ name: 'Test' });
-    // 실제 데이터베이스에 접근함!
-  });
-});
-
-// 구현 세부 사항 테스트
-describe('UsersController', () => {
-  it('should call service', async () => {
-    const service = { create: jest.fn() };
-    const controller = new UsersController(service as any);
-
-    await controller.create({ name: 'Test' });
-
-    expect(service.create).toHaveBeenCalled(); // 동작 대신 구현을 테스트함
-  });
-});
+await controller.create(dto);
+expect(service.create).toHaveBeenCalled();
+// 잘못된 DTO를 넘기거나 서비스 결과를 버려도 통과할 수 있다.
 ```
 
-**올바른 예 (Test.createTestingModule과 모의 의존성을 사용함):**
+**올바른 예 (실제 DI 토큰으로 의존성을 교체하고 결과·실패를 검증함):**
 
 ```typescript
-// 올바른 DI를 위해 Test.createTestingModule 사용
 import { Test, TestingModule } from '@nestjs/testing';
 
-describe('UsersService', () => {
-  let service: UsersService;
-  let repo: jest.Mocked<UserRepository>;
-  let module: TestingModule;
-
-  beforeEach(async () => {
-    module = await Test.createTestingModule({
-      providers: [
-        UsersService,
-        {
-          provide: UserRepository,
-          useValue: {
-            save: jest.fn(),
-            findOne: jest.fn(),
-            find: jest.fn(),
-          },
-        },
-      ],
-    }).compile();
-
-    service = module.get<UsersService>(UsersService);
-    repo = module.get(UserRepository);
-  });
-
-  afterEach(async () => {
-    await module.close();
-    jest.clearAllMocks();
-  });
-
-  describe('create', () => {
-    it('should save and return user', async () => {
-      const dto = { name: 'John', email: 'john@test.com' };
-      const expectedUser = { id: '1', ...dto };
-
-      repo.save.mockResolvedValue(expectedUser);
-
-      const result = await service.create(dto);
-
-      expect(result).toEqual(expectedUser);
-      expect(repo.save).toHaveBeenCalledWith(dto);
-    });
-
-    it('should throw on duplicate email', async () => {
-      repo.findOne.mockResolvedValue({ id: '1', email: 'test@test.com' });
-
-      await expect(
-        service.create({ name: 'Test', email: 'test@test.com' }),
-      ).rejects.toThrow(ConflictException);
-    });
-  });
-
-  describe('findById', () => {
-    it('should return user when found', async () => {
-      const user = { id: '1', name: 'John' };
-      repo.findOne.mockResolvedValue(user);
-
-      const result = await service.findById('1');
-
-      expect(result).toEqual(user);
-    });
-
-    it('should throw NotFoundException when not found', async () => {
-      repo.findOne.mockResolvedValue(null);
-
-      await expect(service.findById('999')).rejects.toThrow(NotFoundException);
-    });
-  });
-});
-
-// 가드와 인터셉터 테스트
-describe('RolesGuard', () => {
-  let guard: RolesGuard;
-  let reflector: Reflector;
-  let module: TestingModule;
-
-  beforeEach(async () => {
-    module = await Test.createTestingModule({
-      providers: [RolesGuard, Reflector],
-    }).compile();
-
-    guard = module.get<RolesGuard>(RolesGuard);
-    reflector = module.get<Reflector>(Reflector);
-  });
-
-  afterEach(async () => { await module.close(); });
-
-  it('should allow when no roles required', () => {
-    const context = createMockExecutionContext({ user: { roles: [] } });
-    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(undefined);
-
-    expect(guard.canActivate(context)).toBe(true);
-  });
-
-  it('should allow admin for admin-only route', () => {
-    const context = createMockExecutionContext({ user: { roles: ['admin'] } });
-    jest.spyOn(reflector, 'getAllAndOverride')
-      .mockImplementation(key => key === 'roles' ? ['admin'] : undefined);
-
-    expect(guard.canActivate(context)).toBe(true);
-  });
-});
-
-function createMockExecutionContext(request: Partial<Request>): ExecutionContext {
-  return {
-    switchToHttp: () => ({
-      getRequest: () => request,
-    }),
-    getHandler: () => jest.fn(),
-    getClass: () => jest.fn(),
-  } as ExecutionContext;
+interface UserSummary { id: string; name: string; }
+export abstract class UserReader {
+  abstract findById(id: string): Promise<UserSummary | null>;
 }
+
+@Injectable()
+export class UsersService {
+  constructor(private readonly reader: UserReader) {}
+
+  async getById(id: string): Promise<UserSummary> {
+    const user = await this.reader.findById(id);
+    if (!user) throw new NotFoundException('User not found');
+    return user;
+  }
+}
+
+describe('UsersService', () => {
+  let moduleRef: TestingModule;
+  let service: UsersService;
+  let reader: jest.Mocked<UserReader>;
+
+  beforeEach(async () => {
+    reader = { findById: jest.fn() };
+    moduleRef = await Test.createTestingModule({
+      providers: [UsersService, { provide: UserReader, useValue: reader }],
+    }).compile();
+    service = moduleRef.get(UsersService);
+  });
+  afterEach(async () => { await moduleRef?.close(); });
+
+  it('returns the requested user', async () => {
+    const user = { id: 'user-1', name: 'Kim' };
+    reader.findById.mockResolvedValue(user);
+    await expect(service.getById('user-1')).resolves.toEqual(user);
+    expect(reader.findById).toHaveBeenCalledWith('user-1');
+  });
+
+  it('rejects a missing user', async () => {
+    reader.findById.mockResolvedValue(null);
+    await expect(service.getById('missing')).rejects.toThrow(NotFoundException);
+  });
+
+  it('preserves an infrastructure failure instead of turning it into 404', async () => {
+    const failure = new Error('database unavailable');
+    reader.findById.mockRejectedValue(failure);
+    await expect(service.getById('user-1')).rejects.toBe(failure);
+  });
+});
 ```
 
-참고: [NestJS Testing](https://docs.nestjs.com/fundamentals/testing)
+기존 모듈의 프로바이더를 교체할 때는 `compile()` 전에 `overrideProvider(실제 토큰).useValue(mock)`를 호출한다.
+
+가드에는 공개 경로·권한 없음·사용자 없음·역할 일치와 불일치를 각각 테스트한다. [가드 규칙](security-use-guards.md)의 메타데이터를 모의 처리할 때는 키에 따라 반환값을 구분한다. 모든 키에 `['admin']`을 반환하면 `isPublic`도 참이 되어 인가를 우회한 테스트가 통과한다.
+
+```typescript
+jest.spyOn(reflector, 'getAllAndOverride')
+  .mockImplementation(key => key === 'roles' ? [Role.Admin] : undefined);
+expect(guard.canActivate(contextWithUser({ roles: [Role.User] }))).toBe(false);
+```
+
+위의 `contextWithUser`는 테스트 전용 `ExecutionContext` 헬퍼다. 실제 클래스·핸들러 메타데이터 연결과 전역 가드 순서는 [E2E 테스트](test-e2e-supertest.md)에서 별도로 확인한다. DB 제약 조건, 쿼리 문법, 잠금은 모의 객체로 증명할 수 없으므로 실제 DB를 사용하는 격리된 통합 테스트를 추가한다. 테스트를 위해 프로덕션 코드를 불필요하게 추상화하지 않는다.
+
+참고: [NestJS 11 Testing](https://docs.nestjs.com/v11/fundamentals/testing)

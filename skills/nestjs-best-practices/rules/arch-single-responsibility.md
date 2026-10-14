@@ -45,62 +45,62 @@ export class UserAndOrderService {
 }
 ```
 
-**올바른 예 (하나의 책임에 집중하는 서비스):**
+**올바른 예 (기능의 책임을 분리하고 조율은 별도 서비스에 둠):**
 
 ```typescript
 // 단일 책임에 집중하는 서비스
 @Injectable()
 export class UsersService {
-  constructor(private userRepo: UserRepository) {}
-
-  async create(dto: CreateUserDto): Promise<User> {
-    return this.userRepo.save(dto);
-  }
+  constructor(private readonly userRepo: UserRepository) {}
 
   async findById(id: string): Promise<User> {
-    return this.userRepo.findOneOrFail({ where: { id } });
+    const user = await this.userRepo.findOne({ where: { id } });
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 }
 
 @Injectable()
 export class OrdersService {
-  constructor(private orderRepo: OrderRepository) {}
+  constructor(private readonly orderRepo: OrderRepository) {}
 
-  async create(userId: string, dto: CreateOrderDto): Promise<Order> {
-    return this.orderRepo.save({ userId, ...dto });
-  }
-
-  async findByUser(userId: string): Promise<Order[]> {
-    return this.orderRepo.find({ where: { userId } });
+  async findRecentByUser(userId: string): Promise<Order[]> {
+    return this.orderRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC', id: 'DESC' },
+      take: 20,
+    });
   }
 }
 
 @Injectable()
-export class OrderStatsService {
-  constructor(private orderRepo: OrderRepository) {}
+export class UserOverviewService {
+  constructor(
+    private readonly users: UsersService,
+    private readonly orders: OrdersService,
+  ) {}
 
-  async calculateForUser(userId: string): Promise<OrderStats> {
-    // 통계 계산에 집중
+  async getOverview(userId: string) {
+    const user = await this.users.findById(userId);
+    const recentOrders = await this.orders.findRecentByUser(user.id);
+    // 실제 응답은 출력 DTO로 필요한 필드만 직렬화한다.
+    return { userId: user.id, recentOrders };
   }
 }
 
-// 컨트롤러나 전용 조정 서비스에서 작업 흐름을 조율
-@Controller('orders')
-export class OrdersController {
-  constructor(
-    private orders: OrdersService,
-    private payment: PaymentService,
-    private notifications: NotificationService,
-  ) {}
+// HTTP 계층은 인증된 사용자와 입력을 전달하고 결과를 반환
+// CurrentUser는 인증 가드가 설정한 사용자를 읽는 프로젝트 데코레이터다.
+@Controller('me')
+export class MyOverviewController {
+  constructor(private readonly overview: UserOverviewService) {}
 
-  @Post()
-  async create(@CurrentUser() user: User, @Body() dto: CreateOrderDto) {
-    const order = await this.orders.create(user.id, dto);
-    await this.payment.charge(order);
-    await this.notifications.sendOrderConfirmation(order);
-    return order;
+  @Get('overview')
+  getOverview(@CurrentUser() user: User) {
+    return this.overview.getOverview(user.id);
   }
 }
 ```
+
+각 기능 모듈은 필요한 서비스를 내보내고, 조정 서비스의 모듈은 해당 기능 모듈들을 가져온다. 같은 업무 흐름에 속하는 메서드를 개별 클래스로 무조건 나누지는 않는다. 주문·결제처럼 여러 쓰기를 수행하는 흐름은 조정 서비스가 트랜잭션, 재시도, 멱등성, 실패 후 상태를 책임져야 한다. 메서드를 여러 서비스로 옮기기만 해서는 원자성이 생기지 않는다.
 
 참고: [NestJS Providers](https://docs.nestjs.com/providers)

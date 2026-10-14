@@ -1,122 +1,111 @@
 ---
 title: 비동기 오류를 올바르게 처리한다
 impact: HIGH
-impactDescription: "처리되지 않은 Promise 거부로 인한 프로세스 장애를 방지함"
+impactDescription: "처리되지 않은 Promise 거부와 조용히 유실되는 작업을 방지함"
 tags: error-handling, async, promises
 ---
 
 ## 비동기 오류를 올바르게 처리한다
 
-NestJS는 비동기 라우트 핸들러에서 발생하는 오류를 자동으로 처리하지만, 백그라운드 작업, 이벤트 핸들러, 직접 만든 Promise의 오류는 애플리케이션을 비정상 종료시킬 수 있다. 항상 비동기 오류를 명시적으로 처리하고 전역 핸들러를 최후의 방어 수단으로 사용한다.
+NestJS는 라우트 핸들러가 반환하거나 기다리는 Promise의 거부를 처리한다. 응답과 분리한 작업은 그 오류 처리 범위에서 벗어난다. 작업이 요청 성공의 일부라면 기다리고, 실패해도 요청에 영향을 주지 않는 작업만 명시적으로 오류를 기록하며 분리한다. 전달 보장이 필요하면 영속 큐와 트랜잭션 아웃박스를 사용한다.
 
-**잘못된 예 (오류 처리 없이 실행하고 기다리지 않음):**
+**잘못된 예 (Promise를 관찰하지 않음):**
 
 ```typescript
-// 오류 처리 없이 실행하고 기다리지 않음
 @Injectable()
 export class UsersService {
   async createUser(dto: CreateUserDto): Promise<User> {
     const user = await this.repo.save(dto);
-
-    // 실행하고 기다리지 않으므로 실패 시 오류를 처리하지 못함!
-    this.emailService.sendWelcome(user.email);
-
+    this.emailService.sendWelcome(user.email); // 거부가 요청의 예외 처리 범위 밖에 있다.
     return user;
   }
 }
 
-// 이벤트 핸들러에서 처리하지 않은 Promise
-@Injectable()
-export class OrdersService {
-  @OnEvent('order.created')
-  handleOrderCreated(event: OrderCreatedEvent) {
-    // Promise를 반환하거나 await하지 않아 리스너의 오류 처리 범위에서 벗어남
-    this.processOrder(event);
-    // 내부에서 거부된 Promise가 처리되지 않을 수 있음
-  }
-
-  private async processOrder(event: OrderCreatedEvent): Promise<void> {
-    await this.inventoryService.reserve(event.items);
-    await this.notificationService.send(event.userId);
-  }
-}
-
-// 예약 작업에 업무 복구 정책이 없음
-@Cron('0 0 * * *')
-async dailyCleanup(): Promise<void> {
-  await this.cleanupService.run();
-  // Nest 스케줄러가 예외를 기록하지만 재시도·복구 정책을 대신 구현하지는 않음
+@OnEvent('order.created')
+handleOrderCreated(event: OrderCreatedEvent) {
+  this.processOrder(event); // 반환하거나 await하지 않아 리스너도 완료·실패를 관찰하지 못한다.
 }
 ```
 
-**올바른 예 (비동기 오류를 명시적으로 처리함):**
+**올바른 예 (작업의 실패 계약을 정하고 Promise를 관찰함):**
 
 ```typescript
-// 기다리지 않는 작업도 명시적인 catch로 오류 처리
+// 반드시 전달할 필요가 없는 알림에만 사용한다.
 @Injectable()
-export class UsersService {
-  private readonly logger = new Logger(UsersService.name);
+export class WelcomeNotifier {
+  private readonly logger = new Logger(WelcomeNotifier.name);
 
-  async createUser(dto: CreateUserDto): Promise<User> {
-    const user = await this.repo.save(dto);
+  constructor(private readonly emailService: EmailService) {}
 
-    // 오류를 명시적으로 잡아 로그 기록
-    this.emailService.sendWelcome(user.email).catch((error) => {
-      this.logger.error('Failed to send welcome email', error.stack);
-      // 필요하면 재시도 큐에 추가
-    });
-
-    return user;
-  }
-}
-
-// 비동기 이벤트 핸들러를 올바르게 처리
-@Injectable()
-export class OrdersService {
-  private readonly logger = new Logger(OrdersService.name);
-
-  @OnEvent('order.created')
-  async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
+  async notify(email: string): Promise<void> {
     try {
-      await this.processOrder(event);
-    } catch (error) {
-      this.logger.error('Failed to process order', { event, error });
-      // 재처리 큐로 전달한다. 큐 발행 실패도 모니터링해야 한다.
-      await this.deadLetterQueue.add('order.created', event);
+      await this.emailService.sendWelcome(email);
+    } catch (error: unknown) {
+      this.logger.error(
+        'Failed to send welcome email',
+        error instanceof Error ? error.stack : 'Non-Error rejection',
+      );
     }
   }
 }
 
-// 안전한 예약 작업
+// 요청과 독립된 최선형 알림: 프로세스 종료 시 유실될 수 있다.
+void this.welcomeNotifier.notify(user.email);
+
+// 프로세스 내 이벤트의 실패를 호출자에게 전달해야 하는 경우
 @Injectable()
-export class CleanupService {
-  private readonly logger = new Logger(CleanupService.name);
+export class OrderListener {
+  constructor(private readonly orderProcessor: OrderProcessor) {}
+
+  @OnEvent('order.created', { suppressErrors: false })
+  async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
+    await this.orderProcessor.process(event);
+  }
+}
+
+@Injectable()
+export class OrderNotifier {
+  constructor(private readonly eventEmitter: EventEmitter2) {}
+
+  async notify(event: OrderCreatedEvent): Promise<void> {
+    // emit()은 리스너의 Promise를 기다리지 않는다.
+    // emitAsync()와 suppressErrors: false를 함께 써야 호출자가 실패를 관찰한다.
+    await this.eventEmitter.emitAsync('order.created', event);
+  }
+}
+
+@Injectable()
+export class CleanupJob {
+  constructor(private readonly cleanupService: CleanupService) {}
 
   @Cron('0 0 * * *')
   async dailyCleanup(): Promise<void> {
-    try {
-      await this.cleanupService.run();
-      this.logger.log('Daily cleanup completed');
-    } catch (error) {
-      this.logger.error('Daily cleanup failed', error.stack);
-      // 알림 또는 재시도 로직
-    }
+    await this.cleanupService.run();
+    // Nest 스케줄러가 예외를 기록한다. 재시도·알림은 별도 정책으로 구성한다.
   }
 }
 
-// main.ts: 치명적 오류의 기본 종료 동작을 바꾸지 않고 관찰한다.
+// main.ts: 애플리케이션 생성 전에 치명적 오류 관찰자를 등록한다.
+import { writeSync } from 'node:fs';
+
+process.on('uncaughtExceptionMonitor', (error, origin) => {
+  // 프로세스가 종료될 때 비동기 로그가 비워진다고 가정하지 않는다.
+  writeSync(process.stderr.fd, `${origin}: ${error.stack ?? error.message}\n`);
+});
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  const logger = new Logger('Bootstrap');
-
-  process.on('uncaughtExceptionMonitor', (error) => {
-    logger.error('Uncaught Exception:', error);
-  });
-
   await app.listen(3000);
 }
+
+void bootstrap().catch((error: unknown) => {
+  writeSync(process.stderr.fd, `${error instanceof Error ? error.stack : 'Bootstrap failed'}\n`);
+  process.exit(1); // 초기화 도중 남은 핸들이 있어도 실패한 프로세스를 유지하지 않는다.
+});
 ```
 
-전역 관찰자는 복구 수단이 아니다. Node의 처리되지 않은 Promise 거부 정책은 실행 옵션으로 확인하고, 치명적 오류 후 프로세스 재시작은 운영 환경에서 관리한다. 반드시 전달해야 하는 이메일·재고 작업은 `.catch()`로 기록하는 것만으로 보장되지 않는다. [이벤트 규칙](arch-use-events.md)의 트랜잭션·아웃박스와 재시도 계약을 적용한다.
+`EventEmitterModule.forRoot()`와 `ScheduleModule.forRoot()` 및 각 리스너·잡 프로바이더를 등록한다. `OrderNotifier.notify()`를 호출하는 쪽도 Promise를 반환하거나 await해야 한다. `emitAsync()`는 트랜잭션이나 영속 큐가 아니므로 한 리스너의 실패가 이미 완료된 다른 리스너의 변경을 되돌리지 않는다. 재고·결제 같은 작업은 [이벤트 규칙](arch-use-events.md)의 정합성·재시도 계약을 적용한다.
 
-참고: [Node.js Unhandled Rejections](https://nodejs.org/api/process.html#event-unhandledrejection)
+`uncaughtExceptionMonitor`는 관찰자이며 복구 수단이 아니다. `uncaughtException`/`unhandledRejection` 리스너로 기록만 하고 프로세스를 계속 살려두지 않는다. Node의 처리되지 않은 Promise 거부 정책은 실행 옵션으로 확인하고 치명적 오류 후 재시작은 운영 환경에서 관리한다. `void`는 린터에 의도를 표시할 뿐 Promise 오류를 처리하지 않는다.
+
+참고: [NestJS Events](https://docs.nestjs.com/techniques/events), [NestJS Task Scheduling](https://docs.nestjs.com/techniques/task-scheduling), [Node.js uncaughtExceptionMonitor](https://nodejs.org/api/process.html#event-uncaughtexceptionmonitor)

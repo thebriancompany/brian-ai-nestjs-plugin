@@ -1,179 +1,95 @@
 ---
-title: 테스트에서 외부 서비스를 모의 객체로 대체한다
+title: 단위 테스트에서 외부 서비스를 모의 객체로 대체한다
 impact: HIGH
-impactDescription: "빠르고 안정적이며 결정적인 테스트를 보장함"
+impactDescription: "외부 호출 없이 성공·실패 경로를 결정적으로 검증함"
 tags: testing, mocking, external-services, jest
 ---
 
-## 테스트에서 외부 서비스를 모의 객체로 대체한다
+## 단위 테스트에서 외부 서비스를 모의 객체로 대체한다
 
-단위 테스트에서 실제 외부 서비스(API, 데이터베이스, 메시지 큐)를 호출하지 않는다. 모의 객체로 대체해 테스트를 빠르고 결정적으로 유지하고 비용이 발생하지 않도록 한다. 현실적인 모의 데이터를 사용하고 시간 초과와 오류 같은 경계 조건도 테스트한다.
+단위 테스트는 실제 API·DB·큐 대신 소비하는 계약을 모의 구현한다. 전체 SDK를 `as any`로 위장하지 말고 사용하는 메서드만 타입으로 제한한다. 실제 DB 동작과 외부 API 계약은 별도의 격리된 통합 테스트에서 검증한다.
 
-**잘못된 예 (실제 API와 데이터베이스를 호출함):**
+**잘못된 예 (비용이 발생하는 실제 호출이나 반환 타입이 다른 모의 객체):**
 
 ```typescript
-// 테스트에서 실제 API 호출
-describe('PaymentService', () => {
-  it('should process payment', async () => {
-    const service = new PaymentService(new StripeClient(realApiKey));
-    // 실제 Stripe API에 접근!
-    const result = await service.charge('tok_visa', 1000);
-    // 느리고 비용이 발생하며 불안정함
-  });
-});
+const service = new PaymentService(new StripeClient(realApiKey));
+await service.charge('tok_visa', 1000); // 단위 테스트가 실제 결제 API에 접근
 
-// 실제 데이터베이스 사용
-describe('UsersService', () => {
-  beforeEach(async () => {
-    await connection.query('DELETE FROM users'); // 실제 DB를 변경함
-  });
-
-  it('should create user', async () => {
-    const user = await service.create({ email: 'test@test.com' });
-    // 공유 데이터베이스에 부수 효과 발생
-  });
-});
-
-// 불완전한 모의 객체
-const mockHttpService = {
-  get: jest.fn().mockResolvedValue({ data: {} }),
-  // 오류 시나리오와 다른 메서드 누락
-};
+const http = { get: jest.fn().mockResolvedValue({ data: {} }) };
+// Nest HttpService.get()은 Promise가 아닌 Observable을 반환한다.
 ```
 
-**올바른 예 (모든 외부 의존성을 모의 객체로 대체함):**
+**올바른 예 (실제 계약과 같은 Observable을 반환함):**
 
 ```typescript
-// HTTP 서비스를 올바르게 모의 구현
+import { HttpService } from '@nestjs/axios';
+import { AxiosError, AxiosHeaders, type AxiosResponse } from 'axios';
+import { firstValueFrom, of, throwError } from 'rxjs';
+
+interface Weather { temperature: number; }
+
+@Injectable()
+export class WeatherService {
+  constructor(private readonly http: HttpService) {}
+
+  async getWeather(city: string): Promise<Weather> {
+    try {
+      const response = await firstValueFrom(this.http.get<Weather>(
+        'https://weather.example.test/current',
+        { params: { city }, timeout: 2000 },
+      ));
+      return response.data;
+    } catch (error: unknown) {
+      if (error instanceof AxiosError && error.code === 'ECONNABORTED') {
+        throw new GatewayTimeoutException('Weather service timed out');
+      }
+      throw new BadGatewayException('Weather service unavailable');
+    }
+  }
+}
+
 describe('WeatherService', () => {
+  let moduleRef: TestingModule;
   let service: WeatherService;
-  let httpService: jest.Mocked<HttpService>;
+  let http: jest.Mocked<Pick<HttpService, 'get'>>;
 
   beforeEach(async () => {
-    const module = await Test.createTestingModule({
-      providers: [
-        WeatherService,
-        {
-          provide: HttpService,
-          useValue: {
-            get: jest.fn(),
-            post: jest.fn(),
-          },
-        },
-      ],
+    http = { get: jest.fn() };
+    moduleRef = await Test.createTestingModule({
+      providers: [WeatherService, { provide: HttpService, useValue: http }],
     }).compile();
-
-    service = module.get(WeatherService);
-    httpService = module.get(HttpService);
+    service = moduleRef.get(WeatherService);
   });
+  afterEach(async () => { await moduleRef?.close(); });
 
-  it('should return weather data', async () => {
-    const mockResponse = {
-      data: { temperature: 72, humidity: 45 },
+  it('returns weather data', async () => {
+    const response: AxiosResponse<Weather> = {
+      data: { temperature: 22 },
       status: 200,
       statusText: 'OK',
       headers: {},
-      config: {},
+      config: { headers: new AxiosHeaders() },
     };
-
-    httpService.get.mockReturnValue(of(mockResponse));
-
-    const result = await service.getWeather('NYC');
-
-    expect(result).toEqual({ temperature: 72, humidity: 45 });
+    http.get.mockReturnValue(of(response));
+    await expect(service.getWeather('Seoul')).resolves.toEqual({ temperature: 22 });
   });
 
-  it('should handle API timeout', async () => {
-    httpService.get.mockReturnValue(
-      throwError(() => new Error('ETIMEDOUT')),
-    );
-
-    await expect(service.getWeather('NYC')).rejects.toThrow('Weather service unavailable');
+  it('maps timeouts to a gateway timeout', async () => {
+    http.get.mockReturnValue(throwError(() => new AxiosError('timeout', 'ECONNABORTED')));
+    await expect(service.getWeather('Seoul')).rejects.toThrow(GatewayTimeoutException);
   });
 
-  it('should handle rate limiting', async () => {
-    httpService.get.mockReturnValue(
-      throwError(() => ({
-        response: { status: 429, data: { message: 'Rate limited' } },
-      })),
-    );
-
-    await expect(service.getWeather('NYC')).rejects.toThrow(TooManyRequestsException);
-  });
-});
-
-// 데이터베이스 대신 리포지토리를 모의 구현
-describe('UsersService', () => {
-  let service: UsersService;
-  let repo: jest.Mocked<Repository<User>>;
-
-  beforeEach(async () => {
-    const mockRepo = {
-      find: jest.fn(),
-      findOne: jest.fn(),
-      save: jest.fn(),
-      delete: jest.fn(),
-      createQueryBuilder: jest.fn(),
-    };
-
-    const module = await Test.createTestingModule({
-      providers: [
-        UsersService,
-        { provide: getRepositoryToken(User), useValue: mockRepo },
-      ],
-    }).compile();
-
-    service = module.get(UsersService);
-    repo = module.get(getRepositoryToken(User));
-  });
-
-  it('should find user by id', async () => {
-    const mockUser = { id: '1', name: 'John', email: 'john@test.com' };
-    repo.findOne.mockResolvedValue(mockUser);
-
-    const result = await service.findById('1');
-
-    expect(result).toEqual(mockUser);
-    expect(repo.findOne).toHaveBeenCalledWith({ where: { id: '1' } });
-  });
-});
-
-// 복잡한 SDK를 위한 모의 객체 팩터리 생성
-function createMockStripe(): jest.Mocked<Stripe> {
-  return {
-    paymentIntents: {
-      create: jest.fn(),
-      retrieve: jest.fn(),
-      confirm: jest.fn(),
-      cancel: jest.fn(),
-    },
-    customers: {
-      create: jest.fn(),
-      retrieve: jest.fn(),
-    },
-  } as any;
-}
-
-// 시간에 의존하는 테스트에서 시간 모의 처리
-describe('TokenService', () => {
-  beforeEach(() => {
-    jest.useFakeTimers();
-    jest.setSystemTime(new Date('2024-01-15'));
-  });
-
-  afterEach(() => {
-    jest.useRealTimers();
-  });
-
-  it('should expire token after 1 hour', async () => {
-    const token = await service.createToken();
-
-    // 시간을 앞으로 이동
-    jest.advanceTimersByTime(61 * 60 * 1000);
-
-    expect(await service.isValid(token)).toBe(false);
+  it('does not expose upstream error details', async () => {
+    http.get.mockReturnValue(throwError(() => new Error('private provider details')));
+    await expect(service.getWeather('Seoul')).rejects.toThrow('Weather service unavailable');
   });
 });
 ```
 
-참고: [Jest Mocking](https://jestjs.io/docs/mock-functions)
+서비스는 외부 응답의 런타임 스키마 검증이 필요한지 별도로 판단한다. 제네릭 타입은 실제 JSON을 검증하지 않는다. 오류 객체는 서비스가 판별하는 실제 타입·코드를 재현하고, 없는 프레임워크 예외 클래스나 문자열 하나로 모든 네트워크 오류를 표현하지 않는다.
+
+DB 모의 객체로는 제약 조건·잠금·트랜잭션을 검증할 수 없다. 중복·동시성은 실제 DB 통합 테스트로 확인한다. 모의 객체가 리포지토리 저장 실패를 던지는 테스트도 포함해 사전 중복 조회만 믿는 구현을 통과시키지 않는다.
+
+시간에 의존하는 테스트는 `jest.useFakeTimers()`와 `jest.setSystemTime()`을 사용하고 `afterEach`에서 `jest.useRealTimers()`로 복원한다. 타이머 콜백을 기다리는 Promise가 있다면 비동기 타이머 진행 API를 사용한다. HTTP·DB 통합 테스트에 가짜 타이머를 전역 적용하면 I/O가 멈출 수 있으므로 순수한 시간 로직으로 범위를 제한한다.
+
+참고: [NestJS HTTP module](https://docs.nestjs.com/v11/techniques/http-module), [Jest Mock Functions](https://jestjs.io/docs/mock-functions), [Jest Timer Mocks](https://jestjs.io/docs/timer-mocks)

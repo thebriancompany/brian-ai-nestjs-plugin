@@ -1,104 +1,75 @@
 ---
 title: 서비스 로케이터 안티패턴을 피한다
 impact: HIGH
-impactDescription: "의존성을 숨기고 테스트 용이성을 해침"
+impactDescription: "의존성을 명시해 테스트와 변경 영향 분석을 쉽게 함"
 tags: dependency-injection, anti-patterns, testing
 ---
 
 ## 서비스 로케이터 안티패턴을 피한다
 
-런타임에 의존성을 찾기 위해 `ModuleRef.get()`이나 전역 컨테이너를 사용하는 것을 피한다. 이 방식은 의존성을 숨기고 테스트를 어렵게 하며 의존성 주입의 이점을 훼손한다. 대신 생성자 주입을 사용한다.
+이미 정해진 업무 의존성을 메서드 안에서 `ModuleRef.get()`이나 전역 컨테이너로 찾지 말고 생성자로 주입한다. `ModuleRef` 자체가 잘못된 API는 아니다. 런타임 플러그인 선택이나 동적 스코프 해석처럼 정적 주입으로 표현하기 어려운 경계에서 사용하고, 일반 서비스까지 조회 로직을 퍼뜨리지 않는다.
 
-**잘못된 예 (서비스 로케이터 안티패턴):**
+**잘못된 예 (업무 메서드가 의존성을 숨김):**
 
 ```typescript
-// ModuleRef로 의존성을 동적으로 조회
 @Injectable()
 export class OrdersService {
-  constructor(private moduleRef: ModuleRef) {}
+  constructor(private readonly moduleRef: ModuleRef) {}
 
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    // 의존성이 숨겨져 생성자에서 보이지 않음
-    const usersService = this.moduleRef.get(UsersService);
-    const inventoryService = this.moduleRef.get(InventoryService);
-    const paymentService = this.moduleRef.get(PaymentService);
-
-    const user = await usersService.findOne(dto.userId);
-    // ... 나머지 로직
-  }
-}
-
-// 전역 싱글턴 컨테이너
-class ServiceContainer {
-  private static instance: ServiceContainer;
-  private services = new Map<string, any>();
-
-  static getInstance(): ServiceContainer {
-    if (!this.instance) {
-      this.instance = new ServiceContainer();
-    }
-    return this.instance;
-  }
-
-  get<T>(key: string): T {
-    return this.services.get(key);
+  async findForUser(userId: string): Promise<Order[]> {
+    const users = this.moduleRef.get(UsersService, { strict: false });
+    const orders = this.moduleRef.get(OrdersRepository, { strict: false });
+    await users.requireById(userId);
+    return orders.findByUser(userId);
   }
 }
 ```
 
-**올바른 예 (생성자 주입으로 의존성을 명시함):**
+**올바른 예 (생성자로 실제 의존성을 명시함):**
 
 ```typescript
-// 생성자 주입으로 의존성을 명시
 @Injectable()
 export class OrdersService {
   constructor(
-    private usersService: UsersService,
-    private inventoryService: InventoryService,
-    private paymentService: PaymentService,
+    private readonly users: UsersService,
+    private readonly orders: OrdersRepository,
   ) {}
 
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    const user = await this.usersService.findOne(dto.userId);
-    const inventory = await this.inventoryService.check(dto.items);
-    // 의존성이 명확하고 테스트 가능
+  async findForUser(userId: string): Promise<Order[]> {
+    await this.users.requireById(userId);
+    return this.orders.findByUser(userId);
   }
 }
 
-// 모의 객체로 쉽게 테스트
-describe('OrdersService', () => {
-  let service: OrdersService;
+// 테스트에서는 실제 DB나 전역 컨테이너 없이 각 의존성을 대체한다.
+const moduleRef = await Test.createTestingModule({
+  providers: [
+    OrdersService,
+    { provide: UsersService, useValue: mockUsersService },
+    { provide: OrdersRepository, useValue: mockOrdersRepository },
+  ],
+}).compile();
+const service = moduleRef.get(OrdersService);
+```
 
-  beforeEach(async () => {
-    const module = await Test.createTestingModule({
-      providers: [
-        OrdersService,
-        { provide: UsersService, useValue: mockUsersService },
-        { provide: InventoryService, useValue: mockInventoryService },
-        { provide: PaymentService, useValue: mockPaymentService },
-      ],
-    }).compile();
+위 예제의 `requireById`는 없으면 예외를 던지는 사용자 조회 계약이다. 해당 서비스의 모듈은 `UsersModule`처럼 필요한 프로바이더를 내보내는 모듈을 가져와야 한다. `ModuleRef.get()`에 `{ strict: false }`를 붙여 누락된 모듈 경계를 숨기지 않는다.
 
-    service = module.get(OrdersService);
-  });
-});
+**정해진 구현 중 선택할 때도 정적 주입으로 충분한 경우:**
 
-// 올바른 사용: 동적 인스턴스 생성을 위한 팩터리 패턴
+```typescript
 @Injectable()
-export class HandlerFactory {
-  constructor(private moduleRef: ModuleRef) {}
+export class HandlerSelector {
+  constructor(
+    private readonly email: EmailHandler,
+    private readonly sms: SmsHandler,
+  ) {}
 
-  getHandler(type: string): Handler {
-    switch (type) {
-      case 'email':
-        return this.moduleRef.get(EmailHandler);
-      case 'sms':
-        return this.moduleRef.get(SmsHandler);
-      default:
-        return this.moduleRef.get(DefaultHandler);
-    }
+  getHandler(type: 'email' | 'sms'): Handler {
+    return type === 'email' ? this.email : this.sms;
   }
 }
 ```
+
+실제 동적 해석이 필요하다면 `get()`은 이미 등록된 정적 프로바이더를 가져오며 새 인스턴스를 만드는 메서드가 아니라는 점을 구분한다. 요청/트랜지언트 스코프는 `resolve()`로 해석한다. 같은 요청의 인스턴스를 공유해야 하면 해당 요청의 `ContextId`를 전달하고, 직접 만든 컨텍스트가 `REQUEST`에 의존한다면 `registerRequestByContextId()`로 요청 객체도 등록한다. `resolve()` 결과를 싱글턴 필드에 저장해 요청 간 공유하지 않는다.
 
 참고: [NestJS Module Reference](https://docs.nestjs.com/fundamentals/module-ref)

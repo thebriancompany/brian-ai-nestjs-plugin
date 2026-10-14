@@ -1,169 +1,110 @@
 ---
 title: E2E 테스트에 Supertest를 사용한다
 impact: HIGH
-impactDescription: "전체 요청과 응답 주기를 검증함"
+impactDescription: "실제 요청 파이프라인과 인증·검증·응답 계약을 확인함"
 tags: testing, e2e, supertest, integration
 ---
 
 ## E2E 테스트에 Supertest를 사용한다
 
-종단 간(E2E) 테스트는 Supertest로 NestJS 애플리케이션에 실제 HTTP 요청을 보낸다. 미들웨어, 가드, 파이프, 인터셉터를 포함한 전체 스택을 테스트한다. E2E 테스트는 단위 테스트에서 놓치는 통합 문제를 찾아낸다.
+컨트롤러를 직접 호출하는 단위 테스트는 유효하지만 라우팅·가드·파이프·직렬화까지 검증하지는 않는다. Supertest로 초기화한 Nest 앱에 요청하고, 운영과 같은 앱 설정을 공유한다. `main.ts`에서만 등록한 파이프는 `createNestApplication()`으로 자동 적용되지 않는다.
 
-**잘못된 예 (E2E 테스트의 준비나 정리가 올바르지 않음):**
+**잘못된 예 (앱과 데이터 격리를 준비하지 않음):**
 
 ```typescript
-// 컨트롤러 단위 테스트만 수행
-describe('UsersController', () => {
-  it('should return users', async () => {
-    const service = { findAll: jest.fn().mockResolvedValue([]) };
-    const controller = new UsersController(service as any);
-
-    const result = await controller.findAll();
-
-    expect(result).toEqual([]);
-    // 라우트, 가드, 파이프, 직렬화는 테스트하지 않음
-  });
-});
-
-// 올바른 준비와 정리가 없는 E2E 테스트
-describe('Users API', () => {
-  it('should create user', async () => {
-    const app = await NestFactory.create(AppModule);
-    // 올바른 초기화 없음
-    // 테스트 후 정리 없음
-    // 실제 데이터베이스에 접근
-  });
+it('creates a user', async () => {
+  const app = await NestFactory.create(AppModule);
+  // 실제 DB·메일·큐 연결 가능. app.init(), 인증 준비, app.close()도 누락됨.
 });
 ```
 
-**올바른 예 (Supertest를 사용해 E2E 테스트를 올바르게 준비함):**
+**올바른 예 (설정·데이터·수명을 명시한 E2E 테스트):**
+
+다음 예제는 `/auth/login`이 200과 `{ accessToken }`을 반환하고 `/users/me`가 인증을 요구하는 앱의 계약을 검증한다. 프로젝트 계약에 맞게 경로·DTO·기대 상태를 조정한다.
 
 ```typescript
-// 올바른 E2E 테스트 설정
-import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
-import * as request from 'supertest';
-import { AppModule } from '../src/app.module';
+// src/configure-app.ts: main.ts와 E2E에서 같은 함수를 호출한다.
+export function configureApp(app: INestApplication): void {
+  app.useGlobalPipes(new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: { enableImplicitConversion: false },
+  }));
+  // 실제 앱의 전역 접두사, 버전, 직렬화 설정도 여기에 둔다.
+  // listen()과 종료 신호 등록은 main.ts에서만 수행한다.
+}
+```
 
-describe('UsersController (e2e)', () => {
-  let app: INestApplication;
+```typescript
+import { randomUUID } from 'node:crypto';
+import { Test } from '@nestjs/testing';
+import request from 'supertest'; // esModuleInterop: true 기준
+import { configureApp } from '../src/configure-app';
+import { TestAppModule } from './fixtures/test-app.module';
+import { seedUser } from './fixtures/seed-user';
 
-  beforeAll(async () => {
-    const moduleFixture: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleFixture.createNestApplication();
-
-    // 운영 환경과 같은 설정 적용
-    app.useGlobalPipes(
-      new ValidationPipe({
-        whitelist: true,
-        transform: true,
-        forbidNonWhitelisted: true,
-      }),
-    );
-
-    await app.init();
-  });
-
-  afterAll(async () => {
-    await app.close();
-  });
-
-  describe('/users (POST)', () => {
-    it('should create a user', () => {
-      return request(app.getHttpServer())
-        .post('/users')
-        .send({ name: 'John', email: 'john@test.com' })
-        .expect(201)
-        .expect((res) => {
-          expect(res.body).toHaveProperty('id');
-          expect(res.body.name).toBe('John');
-          expect(res.body.email).toBe('john@test.com');
-        });
-    });
-
-    it('should return 400 for invalid email', () => {
-      return request(app.getHttpServer())
-        .post('/users')
-        .send({ name: 'John', email: 'invalid-email' })
-        .expect(400)
-        .expect((res) => {
-          expect(res.body.message).toContain('email');
-        });
-    });
-  });
-
-  describe('/users/:id (GET)', () => {
-    it('should return 404 for non-existent user', () => {
-      return request(app.getHttpServer())
-        .get('/users/non-existent-id')
-        .expect(404);
-    });
-  });
-});
-
-// 인증을 포함한 테스트
-describe('Protected Routes (e2e)', () => {
-  let app: INestApplication;
-  let authToken: string;
-
-  beforeAll(async () => {
-    const moduleFixture = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleFixture.createNestApplication();
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
-    await app.init();
-
-    // 인증 토큰 발급
-    const loginResponse = await request(app.getHttpServer())
-      .post('/auth/login')
-      .send({ email: 'test@test.com', password: 'password' });
-
-    authToken = loginResponse.body.accessToken;
-  });
-
-  it('should return 401 without token', () => {
-    return request(app.getHttpServer())
-      .get('/users/me')
-      .expect(401);
-  });
-
-  it('should return user profile with valid token', () => {
-    return request(app.getHttpServer())
-      .get('/users/me')
-      .set('Authorization', `Bearer ${authToken}`)
-      .expect(200)
-      .expect((res) => {
-        expect(res.body.email).toBe('test@test.com');
-      });
-  });
-});
-
-// E2E 테스트의 데이터베이스 격리
-// CI가 테스트 작업마다 독립적인 임시 DB를 생성하고 TEST_DATABASE_URL로 제공한다.
-// 운영 DB와 같은 자격 증명을 사용하지 않는다. .env.test 파일 이름만으로는 격리가 보장되지 않는다.
-describe('Orders API (e2e)', () => {
-  let app: INestApplication;
+// CI가 이 실행 전용 DB를 생성해 TEST_DATABASE_URL로 전달한다.
+// TestAppModule은 앱의 기능 모듈·가드를 재사용하며 DB URL과 외부 어댑터만 교체한다.
+// seedUser는 실제 비밀번호 해시와 활성 계정을 테스트 DB에 저장하는 헬퍼다.
+describe('Authentication (e2e)', () => {
+  let app: INestApplication | undefined;
+  let accessToken: string;
+  const email = `user-${randomUUID()}@example.test`;
+  const password = 'test-only-valid-password';
 
   beforeAll(async () => {
     if (process.env.NODE_ENV !== 'test' || !process.env.TEST_DATABASE_URL) {
       throw new Error('An isolated test database is required');
     }
-    // TestAppModule은 TEST_DATABASE_URL만 사용하고 synchronize:false로 설정한다.
-    const moduleFixture = await Test.createTestingModule({ imports: [TestAppModule] }).compile();
-    app = moduleFixture.createNestApplication();
-    await moduleFixture.get(DataSource).runMigrations();
+    const moduleRef = await Test.createTestingModule({
+      imports: [TestAppModule],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    configureApp(app);
+    await app.get(DataSource).runMigrations();
+    await seedUser(app.get(DataSource), { email, password, isActive: true });
     await app.init();
+
+    const login = await request(app.getHttpServer())
+      .post('/auth/login')
+      .send({ email, password })
+      .expect(200);
+    expect(login.body.accessToken).toEqual(expect.any(String));
+    accessToken = login.body.accessToken;
   });
 
-  // 테스트마다 고유한 데이터를 만들고, 해당 테스트가 만든 데이터만 정리한다.
-  // 테스트 작업이 끝나면 CI가 임시 DB를 폐기한다.
   afterAll(async () => { await app?.close(); });
+
+  it('rejects requests without credentials', async () => {
+    await request(app!.getHttpServer()).get('/users/me').expect(401);
+  });
+
+  it('returns the authenticated profile without secret fields', async () => {
+    const response = await request(app!.getHttpServer())
+      .get('/users/me')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .expect(200);
+    expect(response.body.email).toBe(email);
+    expect(response.body).not.toHaveProperty('passwordHash');
+    expect(response.body).not.toHaveProperty('tokenVersion');
+  });
+
+  it('rejects malformed input before the login handler', async () => {
+    const response = await request(app!.getHttpServer())
+      .post('/auth/login')
+      .send({ email: 'invalid-email', password })
+      .expect(400);
+    // ValidationPipe의 message는 보통 문자열 배열이다.
+    expect(response.body.message).toEqual(
+      expect.arrayContaining([expect.stringContaining('email')]),
+    );
+  });
 });
 ```
 
-참고: [NestJS E2E Testing](https://docs.nestjs.com/fundamentals/testing#end-to-end-testing)
+테스트 DB에는 운영 자격 증명을 제공하지 않는다. `NODE_ENV` 검사나 `.env.test` 파일 이름만으로 격리가 증명되지는 않는다. CI가 별도 DB/사용자를 생성하고 앱·워커 종료 후 폐기해야 한다. 메일·결제 같은 실제 부수 효과는 테스트 어댑터로 바꾸고 그 교체 범위를 명시한다. 앱 초기화·로그인 실패가 다른 테스트의 401로 가려지지 않도록 준비 단계도 검증한다.
+
+404 검증에는 문법상 유효하지만 저장되지 않은 ID를 사용한다. 잘못된 UUID는 파이프에서 400이 된다. 데이터 변경 테스트는 고유 픽스처를 사용하고 실행 순서에 의존하지 않는다. 인증 규칙에는 만료·잘못된 서명·비활성 사용자·권한 변경·토큰 무효화, 응답 규칙에는 중첩 민감 필드 제외를 포함한다. 테스트 전용 설정 때문에 실제 가드나 직렬화가 빠지지 않도록 확인한다.
+
+참고: [NestJS 11 E2E Testing](https://docs.nestjs.com/v11/fundamentals/testing#end-to-end-testing)

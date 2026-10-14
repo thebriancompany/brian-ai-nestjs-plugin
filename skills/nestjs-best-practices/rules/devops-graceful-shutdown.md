@@ -40,6 +40,7 @@ export class ProcessingService {
 
 ```typescript
 import { finalize } from 'rxjs/operators';
+import type { Request, Response, NextFunction } from 'express';
 
 @Injectable()
 export class ShutdownService {
@@ -132,26 +133,34 @@ export class ShutdownCoordinator {
     private readonly tracker: RequestTracker,
   ) {}
 
-  shutdown(app: INestApplication, signal: string, propagationMs = 5000): Promise<void> {
+  shutdown(app: INestApplication, propagationMs = 5000): Promise<void> {
     if (this.pending) return this.pending;
     this.state.startShutdown(); // 다음 readiness 검사부터 503
     this.pending = (async () => {
       // 로드 밸런서의 엔드포인트 갱신 시간. 배포 환경에 맞춰 조정한다.
       await new Promise(resolve => setTimeout(resolve, propagationMs));
       await this.tracker.drain(); // DB 등 요청에 필요한 자원은 아직 열려 있다.
-      await app.close(signal); // Nest의 자원 정리를 정확히 한 번 실행한다.
+      await app.close(); // Nest의 자원 정리를 정확히 한 번 실행한다.
     })();
     return this.pending;
   }
 }
 
-// 위 세 프로바이더를 AppModule에 등록한다.
+@Module({
+  providers: [ShutdownService, RequestTracker, ShutdownCoordinator],
+  exports: [ShutdownService, RequestTracker, ShutdownCoordinator],
+})
+export class ShutdownModule {}
+
+// AppModule과 상태 검사 기능 모듈에서 ShutdownModule을 가져온다.
+// 기능 모듈에서 ShutdownService를 다시 providers에 등록하지 않는다.
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const tracker = app.get(RequestTracker);
   app.use(tracker.use.bind(tracker));
   app.useGlobalInterceptors(tracker);
   const coordinator = app.get(ShutdownCoordinator);
+  await app.listen(3000); // 시작이 끝난 뒤 종료 핸들러를 설치한다.
   let requested = false;
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.on(signal, () => {
@@ -159,16 +168,22 @@ async function bootstrap() {
       requested = true;
       const deadline = setTimeout(() => process.exit(1), 30000);
       deadline.unref();
-      void coordinator.shutdown(app, signal)
-        .catch(error => { console.error(error); process.exitCode = 1; })
-        .finally(() => clearTimeout(deadline));
+      void coordinator.shutdown(app)
+        .then(() => clearTimeout(deadline))
+        .catch(error => {
+          console.error(error);
+          process.exitCode = 1;
+          // 종료 훅 실패로 활성 핸들이 남아도 제한 시간에 강제 종료한다.
+          // 실패 경로에서는 deadline을 해제하지 않는다.
+        });
     });
   }
-  await app.listen(3000);
 }
 ```
 
-프로브 경로는 실제 전역 접두사와 맞춘다. 준비 상태 엔드포인트는 `ShutdownService.isShutdown()`이면 503을 반환한다([상태 검사 규칙](micro-use-health-checks.md)). 추적기와 상태 객체는 앱 전체에서 같은 인스턴스를 사용한다. 요청이 시작한 필수 비동기 작업은 반드시 반환하거나 `await`해야 한다. 반환하지 않은 작업과 별도 스트림의 수명은 이 추적기가 알 수 없다. 가드·미들웨어 실행 중 연결이 끊기고 핸들러에도 진입하지 않은 요청은 완료 여부를 알 수 없으므로 강제 종료 제한까지 보수적으로 기다린다.
+시작 중에는 기본 신호 종료 동작을 유지한다. 비동기 초기화가 끝나기 전에 `app.close()`를 실행하면 뒤늦은 `listen()`으로 서버가 다시 열릴 수 있으므로 종료 핸들러를 시작 완료 후 등록한다.
+
+프로브 경로는 실제 전역 접두사와 맞춘다. 준비 상태 엔드포인트는 `ShutdownService.isShutdown()`이면 503을 반환한다([상태 검사 규칙](micro-use-health-checks.md)). 추적기와 상태 객체는 앱 전체에서 같은 인스턴스를 사용한다. 요청이 시작한 필수 비동기 작업은 반드시 반환하거나 `await`해야 한다. 반환하지 않은 작업과 별도 스트림의 수명은 이 추적기가 알 수 없다. 시간 초과 인터셉터처럼 구독을 먼저 해제하는 코드가 있으면 `finalize` 이후에도 원래 Promise가 실행될 수 있다. 그런 작업은 서비스에서 별도로 등록·추적하고 종료 시 실제 완료 또는 취소 완료를 기다려야 한다. 이 추적기만으로 취소되지 않은 결제·DB 작업까지 안전하게 비웠다고 판단하지 않는다. 가드·미들웨어 실행 중 연결이 끊기고 핸들러에도 진입하지 않은 요청은 완료 여부를 알 수 없으므로 강제 종료 제한까지 보수적으로 기다린다.
 
 이 예제의 범위는 HTTP다. 큐 워커와 WebSocket을 함께 운영한다면 신규 작업을 멈추고 워커의 진행 중인 작업도 비운 다음 `app.close()`를 호출하도록 조율한다. BullMQ의 생산자 `Queue.close()`만으로 워커 작업 완료를 기다릴 수는 없다. 무한 스트림과 장기 작업은 취소·재시도 정책이 필요하다. 강제 종료 제한은 전파 대기 시간과 작업 최대 시간을 포함하고, Kubernetes의 `terminationGracePeriodSeconds`는 이 제한보다 길게 설정한다.
 
